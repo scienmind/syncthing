@@ -39,6 +39,7 @@ var (
 	version   string
 	goVersion float64
 	race      bool
+	debug     = os.Getenv("BUILDDEBUG") != ""
 )
 
 type target struct {
@@ -95,38 +96,57 @@ var targets = map[string]target{
 			{src: "etc/linux-systemd/user/syncthing.service", dst: "deb/usr/lib/systemd/user/syncthing.service", perm: 0644},
 		},
 	},
-	"discosrv": {
-		name:       "discosrv",
-		buildPkg:   "./cmd/discosrv",
-		binaryName: "discosrv", // .exe will be added automatically for Windows builds
+	"stdiscosrv": {
+		name:       "stdiscosrv",
+		buildPkg:   "./cmd/stdiscosrv",
+		binaryName: "stdiscosrv", // .exe will be added automatically for Windows builds
 		archiveFiles: []archiveFile{
 			{src: "{{binary}}", dst: "{{binary}}", perm: 0755},
-			{src: "cmd/discosrv/README.md", dst: "README.txt", perm: 0644},
-			{src: "cmd/discosrv/LICENSE", dst: "LICENSE.txt", perm: 0644},
+			{src: "cmd/stdiscosrv/README.md", dst: "README.txt", perm: 0644},
+			{src: "cmd/stdiscosrv/LICENSE", dst: "LICENSE.txt", perm: 0644},
 			{src: "AUTHORS", dst: "AUTHORS.txt", perm: 0644},
 		},
 		debianFiles: []archiveFile{
 			{src: "{{binary}}", dst: "deb/usr/bin/{{binary}}", perm: 0755},
-			{src: "cmd/discosrv/README.md", dst: "deb/usr/share/doc/discosrv/README.txt", perm: 0644},
-			{src: "cmd/discosrv/LICENSE", dst: "deb/usr/share/doc/discosrv/LICENSE.txt", perm: 0644},
-			{src: "AUTHORS", dst: "deb/usr/share/doc/discosrv/AUTHORS.txt", perm: 0644},
+			{src: "cmd/stdiscosrv/README.md", dst: "deb/usr/share/doc/stdiscosrv/README.txt", perm: 0644},
+			{src: "cmd/stdiscosrv/LICENSE", dst: "deb/usr/share/doc/stdiscosrv/LICENSE.txt", perm: 0644},
+			{src: "AUTHORS", dst: "deb/usr/share/doc/stdiscosrv/AUTHORS.txt", perm: 0644},
+			{src: "man/stdiscosrv.1", dst: "deb/usr/share/man/man1/stdiscosrv.1", perm: 0644},
 		},
 		tags: []string{"purego"},
 	},
-	"relaysrv": {
-		name:       "relaysrv",
-		buildPkg:   "./cmd/relaysrv",
-		binaryName: "relaysrv", // .exe will be added automatically for Windows builds
+	"strelaysrv": {
+		name:       "strelaysrv",
+		buildPkg:   "./cmd/strelaysrv",
+		binaryName: "strelaysrv", // .exe will be added automatically for Windows builds
 		archiveFiles: []archiveFile{
 			{src: "{{binary}}", dst: "{{binary}}", perm: 0755},
-			{src: "cmd/relaysrv/README.md", dst: "README.txt", perm: 0644},
-			{src: "cmd/relaysrv/LICENSE", dst: "LICENSE.txt", perm: 0644},
+			{src: "cmd/strelaysrv/README.md", dst: "README.txt", perm: 0644},
+			{src: "cmd/strelaysrv/LICENSE", dst: "LICENSE.txt", perm: 0644},
 			{src: "AUTHORS", dst: "AUTHORS.txt", perm: 0644},
 		},
 		debianFiles: []archiveFile{
 			{src: "{{binary}}", dst: "deb/usr/bin/{{binary}}", perm: 0755},
-			{src: "cmd/relaysrv/README.md", dst: "deb/usr/share/doc/relaysrv/README.txt", perm: 0644},
-			{src: "cmd/relaysrv/LICENSE", dst: "deb/usr/share/doc/relaysrv/LICENSE.txt", perm: 0644},
+			{src: "cmd/strelaysrv/README.md", dst: "deb/usr/share/doc/strelaysrv/README.txt", perm: 0644},
+			{src: "cmd/strelaysrv/LICENSE", dst: "deb/usr/share/doc/strelaysrv/LICENSE.txt", perm: 0644},
+			{src: "AUTHORS", dst: "deb/usr/share/doc/strelaysrv/AUTHORS.txt", perm: 0644},
+			{src: "man/strelaysrv.1", dst: "deb/usr/share/man/man1/strelaysrv.1", perm: 0644},
+		},
+	},
+	"strelaypoolsrv": {
+		name:       "strelaypoolsrv",
+		buildPkg:   "./cmd/strelaypoolsrv",
+		binaryName: "strelaypoolsrv", // .exe will be added automatically for Windows builds
+		archiveFiles: []archiveFile{
+			{src: "{{binary}}", dst: "{{binary}}", perm: 0755},
+			{src: "cmd/strelaypoolsrv/README.md", dst: "README.txt", perm: 0644},
+			{src: "cmd/strelaypoolsrv/LICENSE", dst: "LICENSE.txt", perm: 0644},
+			{src: "AUTHORS", dst: "AUTHORS.txt", perm: 0644},
+		},
+		debianFiles: []archiveFile{
+			{src: "{{binary}}", dst: "deb/usr/bin/{{binary}}", perm: 0755},
+			{src: "cmd/strelaypoolsrv/README.md", dst: "deb/usr/share/doc/relaysrv/README.txt", perm: 0644},
+			{src: "cmd/strelaypoolsrv/LICENSE", dst: "deb/usr/share/doc/relaysrv/LICENSE.txt", perm: 0644},
 			{src: "AUTHORS", dst: "deb/usr/share/doc/relaysrv/AUTHORS.txt", perm: 0644},
 		},
 	},
@@ -154,6 +174,13 @@ func main() {
 	log.SetOutput(os.Stdout)
 	log.SetFlags(0)
 
+	if debug {
+		t0 := time.Now()
+		defer func() {
+			log.Println("... build completed in", time.Since(t0))
+		}()
+	}
+
 	if os.Getenv("GOPATH") == "" {
 		setGoPath()
 	}
@@ -167,44 +194,42 @@ func main() {
 
 	parseFlags()
 
+	checkArchitecture()
+	goVersion, _ = checkRequiredGoVersion()
+
+	// Invoking build.go with no parameters at all builds everything (incrementally),
+	// which is what you want for maximum error checking during development.
+	if flag.NArg() == 0 {
+		runCommand("install", targets["all"])
+		runCommand("vet", target{})
+		runCommand("lint", target{})
+	} else {
+		// with any command given but not a target, the target is
+		// "syncthing". So "go run build.go install" is "go run build.go install
+		// syncthing" etc.
+		targetName := "syncthing"
+		if flag.NArg() > 1 {
+			targetName = flag.Arg(1)
+		}
+		target, ok := targets[targetName]
+		if !ok {
+			log.Fatalln("Unknown target", target)
+		}
+
+		runCommand(flag.Arg(0), target)
+	}
+}
+
+func checkArchitecture() {
 	switch goarch {
 	case "386", "amd64", "arm", "arm64", "ppc64", "ppc64le":
 		break
 	default:
 		log.Printf("Unknown goarch %q; proceed with caution!", goarch)
 	}
+}
 
-	goVersion, _ = checkRequiredGoVersion()
-
-	// Invoking build.go with no parameters at all is equivalent to "go run
-	// build.go install all" as that builds everything (incrementally),
-	// which is what you want for maximum error checking during development.
-	if flag.NArg() == 0 {
-		var tags []string
-		if noupgrade {
-			tags = []string{"noupgrade"}
-		}
-		install(targets["all"], tags)
-
-		vet("cmd", "lib")
-		lint("./cmd/...")
-		lint("./lib/...")
-		return
-	}
-
-	// Otherwise, with any command given but not a target, the target is
-	// "syncthing". So "go run build.go install" is "go run build.go install
-	// syncthing" etc.
-	targetName := "syncthing"
-	if flag.NArg() > 1 {
-		targetName = flag.Arg(1)
-	}
-	target, ok := targets[targetName]
-	if !ok {
-		log.Fatalln("Unknown target", target)
-	}
-
-	cmd := flag.Arg(0)
+func runCommand(cmd string, target target) {
 	switch cmd {
 	case "setup":
 		setup()
@@ -232,8 +257,8 @@ func main() {
 	case "assets":
 		rebuildAssets()
 
-	case "xdr":
-		xdr()
+	case "proto":
+		proto()
 
 	case "translate":
 		translate()
@@ -261,11 +286,16 @@ func main() {
 		lint(".")
 		lint("./cmd/...")
 		lint("./lib/...")
+
+	case "metalint":
 		if isGometalinterInstalled() {
 			dirs := []string{".", "./cmd/...", "./lib/..."}
-			gometalinter("deadcode", dirs, "test/util.go")
-			gometalinter("structcheck", dirs)
-			gometalinter("varcheck", dirs)
+			ok := gometalinter("deadcode", dirs, "test/util.go")
+			ok = gometalinter("structcheck", dirs) && ok
+			ok = gometalinter("varcheck", dirs) && ok
+			if !ok {
+				os.Exit(1)
+			}
 		}
 
 	default:
@@ -362,7 +392,7 @@ func install(target target, tags []string) {
 	os.Setenv("GOBIN", filepath.Join(cwd, "bin"))
 	args := []string{"install", "-v", "-ldflags", ldflags()}
 	if len(tags) > 0 {
-		args = append(args, "-tags", strings.Join(tags, ","))
+		args = append(args, "-tags", strings.Join(tags, " "))
 	}
 	if race {
 		args = append(args, "-race")
@@ -382,7 +412,7 @@ func build(target target, tags []string) {
 	rmr(target.binaryName)
 	args := []string{"build", "-i", "-v", "-ldflags", ldflags()}
 	if len(tags) > 0 {
-		args = append(args, "-tags", strings.Join(tags, ","))
+		args = append(args, "-tags", strings.Join(tags, " "))
 	}
 	if race {
 		args = append(args, "-race")
@@ -535,16 +565,17 @@ func listFiles(dir string) []string {
 
 func rebuildAssets() {
 	runPipe("lib/auto/gui.files.go", "go", "run", "script/genassets.go", "gui")
+	runPipe("cmd/strelaypoolsrv/auto/gui.go", "go", "run", "script/genassets.go", "cmd/strelaypoolsrv/gui")
 }
 
 func lazyRebuildAssets() {
-	if shouldRebuildAssets() {
+	if shouldRebuildAssets("lib/auto/gui.files.go", "gui") || shouldRebuildAssets("cmd/strelaypoolsrv/auto/gui.go", "cmd/strelaypoolsrv/auto/gui") {
 		rebuildAssets()
 	}
 }
 
-func shouldRebuildAssets() bool {
-	info, err := os.Stat("lib/auto/gui.files.go")
+func shouldRebuildAssets(target, srcdir string) bool {
+	info, err := os.Stat(target)
 	if err != nil {
 		// If the file doesn't exist, we must rebuild it
 		return true
@@ -554,7 +585,7 @@ func shouldRebuildAssets() bool {
 	// so we should rebuild it.
 	currentBuild := info.ModTime()
 	assetsAreNewer := false
-	filepath.Walk("gui", func(path string, info os.FileInfo, err error) error {
+	filepath.Walk(srcdir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -568,8 +599,8 @@ func shouldRebuildAssets() bool {
 	return assetsAreNewer
 }
 
-func xdr() {
-	runPrint("go", "generate", "./lib/discover", "./lib/db", "./lib/protocol", "./lib/relay/protocol")
+func proto() {
+	runPrint("go", "generate", "./lib/...")
 }
 
 func translate() {
@@ -709,15 +740,27 @@ func getBranchSuffix() string {
 }
 
 func buildStamp() int64 {
+	// If SOURCE_DATE_EPOCH is set, use that.
+	if s, _ := strconv.ParseInt(os.Getenv("SOURCE_DATE_EPOCH"), 10, 64); s > 0 {
+		return s
+	}
+
+	// Try to get the timestamp of the latest commit.
 	bs, err := runError("git", "show", "-s", "--format=%ct")
 	if err != nil {
+		// Fall back to "now".
 		return time.Now().Unix()
 	}
+
 	s, _ := strconv.ParseInt(string(bs), 10, 64)
 	return s
 }
 
 func buildUser() string {
+	if v := os.Getenv("BUILD_USER"); v != "" {
+		return v
+	}
+
 	u, err := user.Current()
 	if err != nil {
 		return "unknown-user"
@@ -726,6 +769,10 @@ func buildUser() string {
 }
 
 func buildHost() string {
+	if v := os.Getenv("BUILD_HOST"); v != "" {
+		return v
+	}
+
 	h, err := os.Hostname()
 	if err != nil {
 		return "unknown-host"
@@ -746,13 +793,26 @@ func archiveName(target target) string {
 }
 
 func runError(cmd string, args ...string) ([]byte, error) {
+	if debug {
+		t0 := time.Now()
+		log.Println("runError:", cmd, strings.Join(args, " "))
+		defer func() {
+			log.Println("... in", time.Since(t0))
+		}()
+	}
 	ecmd := exec.Command(cmd, args...)
 	bs, err := ecmd.CombinedOutput()
 	return bytes.TrimSpace(bs), err
 }
 
 func runPrint(cmd string, args ...string) {
-	log.Println(cmd, strings.Join(args, " "))
+	if debug {
+		t0 := time.Now()
+		log.Println("runPrint:", cmd, strings.Join(args, " "))
+		defer func() {
+			log.Println("... in", time.Since(t0))
+		}()
+	}
 	ecmd := exec.Command(cmd, args...)
 	ecmd.Stdout = os.Stdout
 	ecmd.Stderr = os.Stderr
@@ -763,7 +823,13 @@ func runPrint(cmd string, args ...string) {
 }
 
 func runPipe(file, cmd string, args ...string) {
-	log.Println(cmd, strings.Join(args, " "), ">", file)
+	if debug {
+		t0 := time.Now()
+		log.Println("runPipe:", cmd, strings.Join(args, " "))
+		defer func() {
+			log.Println("... in", time.Since(t0))
+		}()
+	}
 	fd, err := os.Create(file)
 	if err != nil {
 		log.Fatal(err)
@@ -852,7 +918,7 @@ func zipFile(out string, files []archiveFile) {
 		if err != nil {
 			log.Fatal(err)
 		}
-		fh.Name = f.dst
+		fh.Name = filepath.ToSlash(f.dst)
 		fh.Method = zip.Deflate
 
 		if strings.HasSuffix(f.dst, ".txt") {
@@ -921,13 +987,17 @@ func lint(pkg string) {
 	}
 
 	analCommentPolicy := regexp.MustCompile(`exported (function|method|const|type|var) [^\s]+ should have comment`)
-	for _, line := range bytes.Split(bs, []byte("\n")) {
-		if analCommentPolicy.Match(line) {
+	for _, line := range strings.Split(string(bs), "\n") {
+		if line == "" {
 			continue
 		}
-		if len(line) > 0 {
-			log.Printf("%s", line)
+		if analCommentPolicy.MatchString(line) {
+			continue
 		}
+		if strings.Contains(line, ".pb.go:") {
+			continue
+		}
+		log.Println(line)
 	}
 }
 
@@ -968,7 +1038,7 @@ func isGometalinterInstalled() bool {
 	return true
 }
 
-func gometalinter(linter string, dirs []string, excludes ...string) {
+func gometalinter(linter string, dirs []string, excludes ...string) bool {
 	params := []string{"--disable-all"}
 	params = append(params, fmt.Sprintf("--deadline=%ds", 60))
 	params = append(params, "--enable="+linter)
@@ -981,12 +1051,19 @@ func gometalinter(linter string, dirs []string, excludes ...string) {
 		params = append(params, dir)
 	}
 
-	bs, err := runError("gometalinter", params...)
+	bs, _ := runError("gometalinter", params...)
 
-	if len(bs) > 0 {
-		log.Printf("%s", bs)
+	nerr := 0
+	for _, line := range strings.Split(string(bs), "\n") {
+		if line == "" {
+			continue
+		}
+		if strings.Contains(line, ".pb.go:") {
+			continue
+		}
+		log.Println(line)
+		nerr++
 	}
-	if err != nil {
-		log.Printf("%v", err)
-	}
+
+	return nerr == 0
 }

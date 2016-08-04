@@ -1,6 +1,6 @@
 .\" Man page generated from reStructuredText.
 .
-.TH "SYNCTHING-REST-API" "7" "June 03, 2016" "v0.12" "Syncthing"
+.TH "SYNCTHING-REST-API" "7" "July 27, 2016" "v0.14" "Syncthing"
 .SH NAME
 syncthing-rest-api \- REST API
 .
@@ -401,6 +401,11 @@ Returns the list of recent log entries.
 .fi
 .UNINDENT
 .UNINDENT
+.SS POST /rest/system/pause
+.sp
+Pause the given device.
+.sp
+Takes the mandatory \fBdevice\fP parameter and returns status 200 and no content upon success, or status 500 and a plain text error on failure.
 .SS GET /rest/system/ping
 .sp
 Returns a \fB{"ping": "pong"}\fP object.
@@ -419,13 +424,6 @@ Returns a \fB{"ping": "pong"}\fP object.
 .SS POST /rest/system/ping
 .sp
 Returns a \fB{"ping": "pong"}\fP object.
-.sp
-\fBNOTE:\fP
-.INDENT 0.0
-.INDENT 3.5
-Due to being a POST request, this method requires using an API key or CSRF token, as opposed to the GET request to the same URL.
-.UNINDENT
-.UNINDENT
 .SS POST /rest/system/reset
 .sp
 Post with empty body to erase the current index database and restart
@@ -445,6 +443,11 @@ $ curl \-X POST \-H "X\-API\-Key: abc123" http://localhost:8384/rest/system/rese
 .SS POST /rest/system/restart
 .sp
 Post with empty body to immediately restart Syncthing.
+.SS POST /rest/system/resume
+.sp
+Resume the given device.
+.sp
+Takes the mandatory \fBdevice\fP parameter and returns status 200 and no content upon success, or status 500 and a plain text error on failure.
 .SS POST /rest/system/shutdown
 .sp
 Post with empty body to cause Syncthing to exit and not restart.
@@ -458,16 +461,46 @@ Returns information about current system status and resource usage.
 .ft C
 {
   "alloc": 30618136,
-  "cpuPercent": 0.006944836512046966,
-  "extAnnounceOK": {
-    "udp4://announce.syncthing.net:22026": true,
-    "udp6://announce\-v6.syncthing.net:22026": true
+  "connectionServiceStatus": {
+    "dynamic+https://relays.syncthing.net/endpoint": {
+      "lanAddresses": [
+        "relay://23.92.71.120:443/?id=53STGR7\-YBM6FCX\-PAZ2RHM\-YPY6OEJ\-WYHVZO7\-PCKQRCK\-PZLTP7T\-434XCAD&pingInterval=1m0s&networkTimeout=2m0s&sessionLimitBps=0&globalLimitBps=0&statusAddr=:22070&providedBy=canton7"
+      ],
+      "wanAddresses": [
+        "relay://23.92.71.120:443/?id=53STGR7\-YBM6FCX\-PAZ2RHM\-YPY6OEJ\-WYHVZO7\-PCKQRCK\-PZLTP7T\-434XCAD&pingInterval=1m0s&networkTimeout=2m0s&sessionLimitBps=0&globalLimitBps=0&statusAddr=:22070&providedBy=canton7"
+      ]
+    },
+    "tcp://0.0.0.0:22000": {
+      "lanAddresses": [
+        "tcp://0.0.0.0:22000"
+      ],
+      "wanAddresses": [
+        "tcp://0.0.0.0:22000"
+      ]
+    }
   },
+  "cpuPercent": 0.006944836512046966,
+  "discoveryEnabled": true,
+  "discoveryErrors": {
+    "global@https://discovery\-v4\-1.syncthing.net/v2/": "500 Internal Server Error",
+    "global@https://discovery\-v4\-2.syncthing.net/v2/": "Post https://discovery\-v4\-2.syncthing.net/v2/: net/http: request canceled while waiting for connection (Client.Timeout exceeded while awaiting headers)",
+    "global@https://discovery\-v4\-3.syncthing.net/v2/": "Post https://discovery\-v4\-3.syncthing.net/v2/: net/http: request canceled while waiting for connection (Client.Timeout exceeded while awaiting headers)",
+    "global@https://discovery\-v6\-1.syncthing.net/v2/": "Post https://discovery\-v6\-1.syncthing.net/v2/: dial tcp [2001:470:28:4d6::5]:443: connect: no route to host",
+    "global@https://discovery\-v6\-2.syncthing.net/v2/": "Post https://discovery\-v6\-2.syncthing.net/v2/: dial tcp [2604:a880:800:10::182:a001]:443: connect: no route to host",
+    "global@https://discovery\-v6\-3.syncthing.net/v2/": "Post https://discovery\-v6\-3.syncthing.net/v2/: dial tcp [2400:6180:0:d0::d9:d001]:443: connect: no route to host"
+  },
+  "discoveryMethods": 8,
   "goroutines": 49,
   "myID": "P56IOI7\-MZJNU2Y\-IQGDREY\-DM2MGTI\-MGL3BXN\-PQ6W5BM\-TBBZ4TJ\-XZWICQ2",
   "pathSeparator": "/",
+  "startTime": "2016\-06\-06T19:41:43.039284753+02:00",
   "sys": 42092792,
-  "tilde": "/Users/jb"
+  "themes": [
+    "default",
+    "dark"
+  ],
+  "tilde": "/Users/jb",
+  "uptime": 2635
 }
 .ft P
 .fi
@@ -644,10 +677,8 @@ availability. Takes \fBfolder\fP and \fBfile\fP parameters.
 .SS GET /rest/db/ignores
 .sp
 Takes one parameter, \fBfolder\fP, and returns the content of the
-\fB\&.stignore\fP as the \fBignore\fP field. A second field, \fBpatterns\fP,
-provides a compiled version of all included ignore patterns in the form
-of regular expressions. Excluded items in the \fBpatterns\fP field have a
-nonstandard \fB(?exclude)\fP marker in front of the regular expression.
+\fB\&.stignore\fP as the \fBignore\fP field. A second field, \fBexpanded\fP,
+provides a list of strings which represent globbing patterns described by gobwas/glob (based on standard wildcards) that match the patterns in \fB\&.stignore\fP and all the includes. If appropriate these globs are prepended by the following modifiers: \fB!\fP to negate the glob, \fB(?i)\fP to do case insensitive matching and \fB(?d)\fP to enable removing of ignored files in an otherwise empty directory.
 .INDENT 0.0
 .INDENT 3.5
 .sp
@@ -655,11 +686,11 @@ nonstandard \fB(?exclude)\fP marker in front of the regular expression.
 .ft C
 {
   "ignore": [
-    "/Backups"
+    "(?i)/Backups"
   ],
-  "patterns": [
-    "(?i)^Backups$",
-    "(?i)^Backups/.*$"
+  "expanded": [
+    "(?i)Backups",
+    "(?i)Backups/**"
   ]
 }
 .ft P
@@ -669,7 +700,7 @@ nonstandard \fB(?exclude)\fP marker in front of the regular expression.
 .SS POST /rest/db/ignores
 .sp
 Expects a format similar to the output of \fBGET\fP call, but only
-containing the \fBignore\fP field (\fBpatterns\fP field should be omitted).
+containing the \fBignore\fP field (\fBexpanded\fP field should be omitted).
 It takes one parameter, \fBfolder\fP, and either updates the content of
 the \fB\&.stignore\fP echoing it back as a response, or returns an error.
 .SS GET /rest/db/need
@@ -740,6 +771,20 @@ available items.
 .INDENT 0.0
 .INDENT 3.5
 This is an expensive call, increasing CPU and RAM usage on the device. Use sparingly.
+.UNINDENT
+.UNINDENT
+.SS POST /rest/db/override
+.sp
+Request override of a master folder.
+Takes the mandatory parameter \fIfolder\fP (folder ID).
+.INDENT 0.0
+.INDENT 3.5
+.sp
+.nf
+.ft C
+curl \-X POST http://127.0.0.1:8384/rest/db/override?folder=default
+.ft P
+.fi
 .UNINDENT
 .UNINDENT
 .SS POST /rest/db/prio

@@ -29,6 +29,7 @@ angular.module('syncthing.core')
         $scope.myID = '';
         $scope.devices = [];
         $scope.deviceRejections = {};
+        $scope.discoveryCache = {};
         $scope.folderRejections = {};
         $scope.protocolChanged = false;
         $scope.reportData = {};
@@ -49,6 +50,7 @@ angular.module('syncthing.core')
         $scope.failedCurrentFolder = undefined;
         $scope.failedPageSize = 10;
         $scope.scanProgress = {};
+        $scope.themes = [];
 
         $scope.localStateTotal = {
             bytes: 0,
@@ -84,10 +86,12 @@ angular.module('syncthing.core')
             console.log('UIOnline');
 
             refreshSystem();
+            refreshDiscoveryCache();
             refreshConfig();
             refreshConnectionStats();
             refreshDeviceStats();
             refreshFolderStats();
+            refreshThemes();
 
             $http.get(urlbase + '/system/version').success(function (data) {
                 if ($scope.version.version && $scope.version.version !== data.version) {
@@ -416,6 +420,22 @@ angular.module('syncthing.core')
             }).error($scope.emitHTTPError);
         }
 
+        function refreshDiscoveryCache() {
+            $http.get(urlbase + '/system/discovery').success(function (data) {
+                for (var device in data) {
+                    for (var i = 0; i < data[device].addresses.length; i++) {
+                        // Relay addresses are URLs with
+                        // .../?foo=barlongstuff that we strip away here. We
+                        // remove the final slash as well for symmetry with
+                        // tcp://192.0.2.42:1234 type addresses.
+                        data[device].addresses[i] = data[device].addresses[i].replace(/\/\?.*/, '');
+                    }
+                }
+                $scope.discoveryCache = data;
+                console.log("refreshDiscoveryCache", data);
+            }).error($scope.emitHTTPError);
+        }
+
         function recalcLocalStateTotal () {
             $scope.localStateTotal = {
                 bytes: 0,
@@ -599,8 +619,15 @@ angular.module('syncthing.core')
             }).error($scope.emitHTTPError);
         }, 2500);
 
+        var refreshThemes = debounce(function () {
+            $http.get("themes.json").success(function (data) { // no urlbase here as this is served by the asset handler
+                $scope.themes = data.themes;
+            }).error($scope.emitHTTPError);
+        }, 2500);
+
         $scope.refresh = function () {
             refreshSystem();
+            refreshDiscoveryCache();
             refreshConnectionStats();
             refreshErrors();
         };
@@ -627,7 +654,7 @@ angular.module('syncthing.core')
                 return 'outofsync';
             }
             if (state === 'scanning') {
-                return state; 
+                return state;
             }
 
             if (folderCfg.devices.length <= 1) {
@@ -1020,10 +1047,6 @@ angular.module('syncthing.core')
             });
         };
 
-        $scope.upgradeMajor = function () {
-            $('#majorUpgrade').modal();
-        };
-
         $scope.shutdown = function () {
             restarting = true;
             $http.post(urlbase + '/system/shutdown').success(function () {
@@ -1042,12 +1065,6 @@ angular.module('syncthing.core')
             });
             $scope.deviceEditor.$setPristine();
             $('#editDevice').modal();
-        };
-
-        $scope.idDevice = function (deviceCfg) {
-            $scope.currentDevice = deviceCfg;
-            $('#editDevice').modal('hide');
-            $('#idqr').modal('show');
         };
 
         $scope.addDevice = function (deviceID, name) {
@@ -1221,6 +1238,18 @@ angular.module('syncthing.core')
             }).error($scope.emitHTTPError);
         });
 
+        $scope.loadFormIntoScope = function (form) {
+            console.log('loadFormIntoScope',form.$name);
+            switch (form.$name) {
+                case 'deviceEditor':
+                    $scope.deviceEditor = form;
+                    break;
+                case 'folderEditor':
+                    $scope.folderEditor = form;
+                    break;
+            }
+        }
+
         $scope.editFolder = function (folderCfg) {
             $scope.currentFolder = angular.copy(folderCfg);
             if ($scope.currentFolder.path.slice(-1) === $scope.system.pathSeparator) {
@@ -1289,7 +1318,7 @@ angular.module('syncthing.core')
             $scope.editingExisting = false;
             $scope.folderEditor.$setPristine();
             $http.get(urlbase + '/svc/random/string?length=10').success(function (data) {
-                $scope.currentFolder.id = data.random.substr(0, 5) + '-' + data.random.substr(5, 5);
+                $scope.currentFolder.id = (data.random.substr(0, 5) + '-' + data.random.substr(5, 5)).toLowerCase();
                 $('#editFolder').modal();
             });
         };
@@ -1424,7 +1453,7 @@ angular.module('syncthing.core')
                 }
             }
 
-            folders.sort();
+            folders.sort(folderCompare);
             return folders;
         };
 
@@ -1456,20 +1485,11 @@ angular.module('syncthing.core')
             $http.get(urlbase + '/db/ignores?folder=' + encodeURIComponent($scope.currentFolder.id))
                 .success(function (data) {
                     data.ignore = data.ignore || [];
-
-                    $('#editFolder').modal('hide')
-                        .one('hidden.bs.modal', function() {
-                            var textArea = $('#editIgnores textarea');
-
-                            textArea.val(data.ignore.join('\n'));
-
-                            $('#editIgnores').modal()
-                                .one('hidden.bs.modal', function () {
-                                    $('#editFolder').modal();
-                                })
-                                .one('shown.bs.modal', function () {
-                                    textArea.focus();
-                                });
+                    var textArea = $('#editIgnores textarea');
+                    textArea.val(data.ignore.join('\n'));
+                    $('#editIgnores').modal()
+                        .one('shown.bs.modal', function () {
+                            textArea.focus();
                         });
                 })
                 .then(function () {
@@ -1491,16 +1511,6 @@ angular.module('syncthing.core')
             $http.get(urlbase + '/svc/random/string?length=32').success(function (data) {
                 cfg.apiKey = data.random;
             });
-        };
-
-        $scope.showURPreview = function () {
-            $('#settings').modal('hide')
-                .one('hidden.bs.modal', function() {
-                    $('#urPreview').modal()
-                        .one('hidden.bs.modal', function () {
-                            $('#settings').modal();
-                        });
-                });
         };
 
         $scope.acceptUR = function () {
@@ -1545,10 +1555,6 @@ angular.module('syncthing.core')
 
         $scope.override = function (folder) {
             $http.post(urlbase + "/db/override?folder=" + encodeURIComponent(folder));
-        };
-
-        $scope.about = function () {
-            $('#about').modal('show');
         };
 
         $scope.advanced = function () {
@@ -1634,6 +1640,14 @@ angular.module('syncthing.core')
             });
         };
 
-        // pseudo main. called on all definitions assigned
-        initController();
+        $scope.modalLoaded = function () {
+
+            // once all modal elements have been processed
+            if ($('modal').length === 0) {
+
+                // pseudo main. called on all definitions assigned
+                initController();
+            }
+        }
+
     });

@@ -11,6 +11,7 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -68,11 +69,8 @@ func TestStopAfterBrokenConfig(t *testing.T) {
 	}
 	w := config.Wrap("/dev/null", cfg)
 
-	srv, err := newAPIService(protocol.LocalDeviceID, w, "../../test/h1/https-cert.pem", "../../test/h1/https-key.pem", "", nil, nil, nil, nil, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv.started = make(chan struct{})
+	srv := newAPIService(protocol.LocalDeviceID, w, "../../test/h1/https-cert.pem", "../../test/h1/https-key.pem", "", nil, nil, nil, nil, nil, nil)
+	srv.started = make(chan string)
 
 	sup := suture.NewSimple("test")
 	sup.Add(srv)
@@ -90,8 +88,8 @@ func TestStopAfterBrokenConfig(t *testing.T) {
 			RawUseTLS:  false,
 		},
 	}
-	if srv.CommitConfiguration(cfg, newCfg) {
-		t.Fatal("Config commit should have failed")
+	if err := srv.VerifyConfiguration(cfg, newCfg); err == nil {
+		t.Fatal("Verify config should have failed")
 	}
 
 	// Nonetheless, it should be fine to Stop() it without panic.
@@ -119,7 +117,7 @@ func TestAssetsDir(t *testing.T) {
 	gw.Close()
 	foo := buf.Bytes()
 
-	e := embeddedStatic{
+	e := &staticsServer{
 		theme:    "foo",
 		mut:      sync.NewRWMutex(),
 		assetDir: "testdata",
@@ -475,29 +473,25 @@ func startHTTP(cfg *mockedConfig) (string, error) {
 	connections := new(mockedConnections)
 	errorLog := new(mockedLoggerRecorder)
 	systemLog := new(mockedLoggerRecorder)
+	addrChan := make(chan string)
 
 	// Instantiate the API service
-	svc, err := newAPIService(protocol.LocalDeviceID, cfg, httpsCertFile, httpsKeyFile, assetDir, model,
+	svc := newAPIService(protocol.LocalDeviceID, cfg, httpsCertFile, httpsKeyFile, assetDir, model,
 		eventSub, discoverer, connections, errorLog, systemLog)
-	if err != nil {
-		return "", err
-	}
-
-	// Make sure the API service is listening, and get the URL to use.
-	addr := svc.listener.Addr()
-	if addr == nil {
-		return "", fmt.Errorf("Nil listening address from API service")
-	}
-	tcpAddr, err := net.ResolveTCPAddr("tcp", addr.String())
-	if err != nil {
-		return "", fmt.Errorf("Weird address from API service: %v", err)
-	}
-	baseURL := fmt.Sprintf("http://127.0.0.1:%d", tcpAddr.Port)
+	svc.started = addrChan
 
 	// Actually start the API service
 	supervisor := suture.NewSimple("API test")
 	supervisor.Add(svc)
 	supervisor.ServeBackground()
+
+	// Make sure the API service is listening, and get the URL to use.
+	addr := <-addrChan
+	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
+	if err != nil {
+		return "", fmt.Errorf("Weird address from API service: %v", err)
+	}
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d", tcpAddr.Port)
 
 	return baseURL, nil
 }
@@ -619,4 +613,56 @@ func TestRandomString(t *testing.T) {
 	if len(res["random"]) != 27 {
 		t.Errorf("Expected 27 random characters, got %q of length %d", res["random"], len(res["random"]))
 	}
+}
+
+func TestConfigPostOK(t *testing.T) {
+	cfg := bytes.NewBuffer([]byte(`{
+		"version": 15,
+		"folders": [
+			{"id": "foo"}
+		]
+	}`))
+
+	resp, err := testConfigPost(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Error("Expected 200 OK, not", resp.Status)
+	}
+}
+
+func TestConfigPostDupFolder(t *testing.T) {
+	cfg := bytes.NewBuffer([]byte(`{
+		"version": 15,
+		"folders": [
+			{"id": "foo"},
+			{"id": "foo"}
+		]
+	}`))
+
+	resp, err := testConfigPost(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Error("Expected 400 Bad Request, not", resp.Status)
+	}
+}
+
+func testConfigPost(data io.Reader) (*http.Response, error) {
+	const testAPIKey = "foobarbaz"
+	cfg := new(mockedConfig)
+	cfg.gui.APIKey = testAPIKey
+	baseURL, err := startHTTP(cfg)
+	if err != nil {
+		return nil, err
+	}
+	cli := &http.Client{
+		Timeout: time.Second,
+	}
+
+	req, _ := http.NewRequest("POST", baseURL+"/rest/system/config", data)
+	req.Header.Set("X-API-Key", testAPIKey)
+	return cli.Do(req)
 }

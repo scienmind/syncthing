@@ -16,7 +16,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	_ "net/http/pprof"
 	"net/url"
 	"os"
 	"os/signal"
@@ -51,7 +50,7 @@ import (
 
 var (
 	Version           = "unknown-dev"
-	Codename          = "Copper Cockroach"
+	Codename          = "Dysprosium Dragonfly"
 	BuildStamp        = "0"
 	BuildDate         time.Time
 	BuildHost         = "unknown"
@@ -539,8 +538,9 @@ func syncthingMain(runtimeOptions RuntimeOptions) {
 	errors := logger.NewRecorder(l, logger.LevelWarn, maxSystemErrors, 0)
 	systemLog := logger.NewRecorder(l, logger.LevelDebug, maxSystemLog, initialSystemLog)
 
-	// Event subscription for the API; must start early to catch the early events.  The LocalDiskUpdated
-	// event might overwhelm the event reciever in some situations so we will not subscribe to it here.
+	// Event subscription for the API; must start early to catch the early
+	// events. The LocalChangeDetected event might overwhelm the event
+	// receiver in some situations so we will not subscribe to it here.
 	apiSub := events.NewBufferedSubscription(events.Default.Subscribe(events.AllEvents&^events.LocalChangeDetected), 1000)
 
 	if len(os.Getenv("GOMAXPROCS")) == 0 {
@@ -681,17 +681,9 @@ func syncthingMain(runtimeOptions RuntimeOptions) {
 		}
 	}
 
-	// Clear out old indexes for other devices. Otherwise we'll start up and
-	// start needing a bunch of files which are nowhere to be found. This
-	// needs to be changed when we correctly do persistent indexes.
+	// Add and start folders
 	for _, folderCfg := range cfg.Folders() {
 		m.AddFolder(folderCfg)
-		for _, device := range folderCfg.DeviceIDs() {
-			if device == myID {
-				continue
-			}
-			m.Index(device, folderCfg.ID, nil, 0, nil)
-		}
 		m.StartFolder(folderCfg.ID)
 	}
 
@@ -863,7 +855,6 @@ func loadConfig() (*config.Wrapper, error) {
 	cfg, err := config.Load(cfgFile, myID)
 
 	if err != nil {
-		l.Infoln("Error loading config file; using defaults for now")
 		myName, _ := os.Hostname()
 		newCfg := defaultConfig(myName)
 		cfg = config.Wrap(cfgFile, newCfg)
@@ -933,10 +924,7 @@ func setupGUI(mainService *suture.Supervisor, cfg *config.Wrapper, m *model.Mode
 		l.Warnln("Insecure admin access is enabled.")
 	}
 
-	api, err := newAPIService(myID, cfg, locations[locHTTPSCertFile], locations[locHTTPSKeyFile], runtimeOptions.assetDir, m, apiSub, discoverer, connectionsService, errors, systemLog)
-	if err != nil {
-		l.Fatalln("Cannot start GUI:", err)
-	}
+	api := newAPIService(myID, cfg, locations[locHTTPSCertFile], locations[locHTTPSKeyFile], runtimeOptions.assetDir, m, apiSub, discoverer, connectionsService, errors, systemLog)
 	cfg.Subscribe(api)
 	mainService.Add(api)
 
@@ -1133,6 +1121,8 @@ func cleanConfigDirectory() {
 		"panic-*.log":      7 * 24 * time.Hour,  // keep panic logs for a week
 		"audit-*.log":      7 * 24 * time.Hour,  // keep audit logs for a week
 		"index":            14 * 24 * time.Hour, // keep old index format for two weeks
+		"index-v0.11.0.db": 14 * 24 * time.Hour, // keep old index format for two weeks
+		"index-v0.13.0.db": 14 * 24 * time.Hour, // keep old index format for two weeks
 		"index*.converted": 14 * 24 * time.Hour, // keep old converted indexes for two weeks
 		"config.xml.v*":    30 * 24 * time.Hour, // old config versions for a month
 		"*.idx.gz":         30 * 24 * time.Hour, // these should for sure no longer exist

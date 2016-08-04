@@ -7,26 +7,23 @@
 package main
 
 import (
-	"bytes"
-	"compress/gzip"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"mime"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/rcrowley/go-metrics"
-	"github.com/syncthing/syncthing/lib/auto"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/db"
 	"github.com/syncthing/syncthing/lib/discover"
@@ -45,8 +42,7 @@ import (
 )
 
 var (
-	configInSync = true
-	startTime    = time.Now()
+	startTime = time.Now()
 )
 
 type apiService struct {
@@ -54,8 +50,7 @@ type apiService struct {
 	cfg                configIntf
 	httpsCertFile      string
 	httpsKeyFile       string
-	assetDir           string
-	themes             []string
+	statics            *staticsServer
 	model              modelIntf
 	eventSub           events.BufferedSubscription
 	discoverer         discover.CachingMux
@@ -64,10 +59,8 @@ type apiService struct {
 	systemConfigMut    sync.Mutex    // serializes posts to /rest/system/config
 	stop               chan struct{} // signals intentional stop
 	configChanged      chan struct{} // signals intentional listener close due to config change
-	started            chan struct{} // signals startup complete, for testing only
-
-	listener    net.Listener
-	listenerMut sync.Mutex
+	started            chan string   // signals startup complete by sending the listener address, for testing only
+	startedOnce        bool          // the service has started successfully at least once
 
 	guiErrors logger.Recorder
 	systemLog logger.Recorder
@@ -93,13 +86,13 @@ type modelIntf interface {
 	DelayScan(folder string, next time.Duration)
 	ScanFolder(folder string) error
 	ScanFolders() map[string]error
-	ScanFolderSubs(folder string, subs []string) error
+	ScanFolderSubdirs(folder string, subs []string) error
 	BringToFront(folder, file string)
 	ConnectedTo(deviceID protocol.DeviceID) bool
 	GlobalSize(folder string) (nfiles, deleted int, bytes int64)
 	LocalSize(folder string) (nfiles, deleted int, bytes int64)
-	CurrentLocalVersion(folder string) (int64, bool)
-	RemoteLocalVersion(folder string) (int64, bool)
+	CurrentSequence(folder string) (int64, bool)
+	RemoteSequence(folder string) (int64, bool)
 	State(folder string) (string, time.Time, error)
 }
 
@@ -107,25 +100,26 @@ type configIntf interface {
 	GUI() config.GUIConfiguration
 	Raw() config.Configuration
 	Options() config.OptionsConfiguration
-	Replace(cfg config.Configuration) config.CommitResponse
+	Replace(cfg config.Configuration) error
 	Subscribe(c config.Committer)
 	Folders() map[string]config.FolderConfiguration
 	Devices() map[protocol.DeviceID]config.DeviceConfiguration
 	Save() error
 	ListenAddresses() []string
+	RequiresRestart() bool
 }
 
 type connectionsIntf interface {
 	Status() map[string]interface{}
 }
 
-func newAPIService(id protocol.DeviceID, cfg configIntf, httpsCertFile, httpsKeyFile, assetDir string, m modelIntf, eventSub events.BufferedSubscription, discoverer discover.CachingMux, connectionsService connectionsIntf, errors, systemLog logger.Recorder) (*apiService, error) {
+func newAPIService(id protocol.DeviceID, cfg configIntf, httpsCertFile, httpsKeyFile, assetDir string, m modelIntf, eventSub events.BufferedSubscription, discoverer discover.CachingMux, connectionsService connectionsIntf, errors, systemLog logger.Recorder) *apiService {
 	service := &apiService{
 		id:                 id,
 		cfg:                cfg,
 		httpsCertFile:      httpsCertFile,
 		httpsKeyFile:       httpsKeyFile,
-		assetDir:           assetDir,
+		statics:            newStaticsServer(cfg.GUI().Theme, assetDir),
 		model:              m,
 		eventSub:           eventSub,
 		discoverer:         discoverer,
@@ -133,33 +127,11 @@ func newAPIService(id protocol.DeviceID, cfg configIntf, httpsCertFile, httpsKey
 		systemConfigMut:    sync.NewMutex(),
 		stop:               make(chan struct{}),
 		configChanged:      make(chan struct{}),
-		listenerMut:        sync.NewMutex(),
 		guiErrors:          errors,
 		systemLog:          systemLog,
 	}
 
-	seen := make(map[string]struct{})
-	// Load themes from compiled in assets.
-	for file := range auto.Assets() {
-		theme := strings.Split(file, "/")[0]
-		if _, ok := seen[theme]; !ok {
-			seen[theme] = struct{}{}
-			service.themes = append(service.themes, theme)
-		}
-	}
-	if assetDir != "" {
-		// Load any extra themes from the asset override dir.
-		for _, dir := range dirNames(assetDir) {
-			if _, ok := seen[dir]; !ok {
-				seen[dir] = struct{}{}
-				service.themes = append(service.themes, dir)
-			}
-		}
-	}
-
-	var err error
-	service.listener, err = service.getListener(cfg.GUI())
-	return service, err
+	return service
 }
 
 func (s *apiService) getListener(guiCfg config.GUIConfiguration) (net.Listener, error) {
@@ -226,9 +198,22 @@ func sendJSON(w http.ResponseWriter, jsonObject interface{}) {
 }
 
 func (s *apiService) Serve() {
-	s.listenerMut.Lock()
-	listener := s.listener
-	s.listenerMut.Unlock()
+	listener, err := s.getListener(s.cfg.GUI())
+	if err != nil {
+		if !s.startedOnce {
+			// This is during initialization. A failure here should be fatal
+			// as there will be no way for the user to communicate with us
+			// otherwise anyway.
+			l.Fatalln("Starting API/GUI:", err)
+		}
+
+		// We let this be a loud user-visible warning as it may be the only
+		// indication they get that the GUI won't be available on startup.
+		l.Warnln("Starting API/GUI:", err)
+		return
+	}
+	s.startedOnce = true
+	defer listener.Close()
 
 	if listener == nil {
 		// Not much we can do here other than exit quickly. The supervisor
@@ -284,8 +269,12 @@ func (s *apiService) Serve() {
 	postRestMux.HandleFunc("/rest/system/debug", s.postSystemDebug)            // [enable] [disable]
 
 	// Debug endpoints, not for general use
-	getRestMux.HandleFunc("/rest/debug/peerCompletion", s.getPeerCompletion)
-	getRestMux.HandleFunc("/rest/debug/httpmetrics", s.getSystemHTTPMetrics)
+	debugMux := http.NewServeMux()
+	debugMux.HandleFunc("/rest/debug/peerCompletion", s.getPeerCompletion)
+	debugMux.HandleFunc("/rest/debug/httpmetrics", s.getSystemHTTPMetrics)
+	debugMux.HandleFunc("/rest/debug/cpuprof", s.getCPUProf) // duration
+	debugMux.HandleFunc("/rest/debug/heapprof", s.getHeapProf)
+	getRestMux.Handle("/rest/debug/", s.whenDebugging(debugMux))
 
 	// A handler that splits requests between the two above and disables
 	// caching
@@ -297,19 +286,10 @@ func (s *apiService) Serve() {
 	mux.HandleFunc("/qr/", s.getQR)
 
 	// Serve compiled in assets unless an asset directory was set (for development)
-	assets := &embeddedStatic{
-		theme:        s.cfg.GUI().Theme,
-		lastModified: time.Now().Truncate(time.Second), // must truncate, for the wire precision is 1s
-		mut:          sync.NewRWMutex(),
-		assetDir:     s.assetDir,
-		assets:       auto.Assets(),
-	}
-	mux.Handle("/", assets)
+	mux.Handle("/", s.statics)
 
 	// Handle the special meta.js path
 	mux.HandleFunc("/meta.js", s.getJSMetadata)
-
-	s.cfg.Subscribe(assets)
 
 	guiCfg := s.cfg.GUI()
 
@@ -348,33 +328,33 @@ func (s *apiService) Serve() {
 	l.Infoln("Access the GUI via the following URL:", guiCfg.URL())
 	if s.started != nil {
 		// only set when run by the tests
-		close(s.started)
+		s.started <- listener.Addr().String()
 	}
-	err := srv.Serve(listener)
 
-	// The return could be due to an intentional close. Wait for the stop
-	// signal before returning. IF there is no stop signal within a second, we
-	// assume it was unintentional and log the error before retrying.
+	// Serve in the background
+
+	serveError := make(chan error, 1)
+	go func() {
+		serveError <- srv.Serve(listener)
+	}()
+
+	// Wait for stop, restart or error signals
+
 	select {
 	case <-s.stop:
+		// Shutting down permanently
+		l.Debugln("shutting down (stop)")
 	case <-s.configChanged:
-	case <-time.After(time.Second):
-		l.Warnln("API:", err)
+		// Soft restart due to configuration change
+		l.Debugln("restarting (config changed)")
+	case <-serveError:
+		// Restart due to listen/serve failure
+		l.Warnln("GUI/API:", err, "(restarting)")
 	}
 }
 
 func (s *apiService) Stop() {
-	s.listenerMut.Lock()
-	listener := s.listener
-	s.listenerMut.Unlock()
-
 	close(s.stop)
-
-	// listener may be nil here if we've had a config change to a broken
-	// configuration, in which case we shouldn't try to close it.
-	if listener != nil {
-		listener.Close()
-	}
 }
 
 func (s *apiService) String() string {
@@ -382,35 +362,25 @@ func (s *apiService) String() string {
 }
 
 func (s *apiService) VerifyConfiguration(from, to config.Configuration) error {
+	if _, err := net.ResolveTCPAddr("tcp", to.GUI.Address()); err != nil {
+		return err
+	}
 	return nil
 }
 
 func (s *apiService) CommitConfiguration(from, to config.Configuration) bool {
+	// No action required when this changes, so mask the fact that it changed at all.
+	from.GUI.Debugging = to.GUI.Debugging
+
 	if to.GUI == from.GUI {
 		return true
 	}
 
-	// Order here is important. We must close the listener to stop Serve(). We
-	// must create a new listener before Serve() starts again. We can't create
-	// a new listener on the same port before the previous listener is closed.
-	// To assist in this little dance the Serve() method will wait for a
-	// signal on the configChanged channel after the listener has closed.
-
-	s.listenerMut.Lock()
-	defer s.listenerMut.Unlock()
-
-	s.listener.Close()
-
-	var err error
-	s.listener, err = s.getListener(to.GUI)
-	if err != nil {
-		// Ideally this should be a verification error, but we check it by
-		// creating a new listener which requires shutting down the previous
-		// one first, which is too destructive for the VerifyConfiguration
-		// method.
-		return false
+	if to.GUI.Theme != from.GUI.Theme {
+		s.statics.setTheme(to.GUI.Theme)
 	}
 
+	// Tell the serve loop to restart
 	s.configChanged <- struct{}{}
 
 	return true
@@ -525,6 +495,18 @@ func withDetailsMiddleware(id protocol.DeviceID, h http.Handler) http.Handler {
 	})
 }
 
+func (s *apiService) whenDebugging(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.cfg.GUI().Debugging {
+			h.ServeHTTP(w, r)
+			return
+		}
+
+		http.Error(w, "Debugging disabled", http.StatusBadRequest)
+		return
+	})
+}
+
 func (s *apiService) restPing(w http.ResponseWriter, r *http.Request) {
 	sendJSON(w, map[string]string{"ping": "pong"})
 }
@@ -615,7 +597,7 @@ func (s *apiService) getDBStatus(w http.ResponseWriter, r *http.Request) {
 func folderSummary(cfg configIntf, m modelIntf, folder string) map[string]interface{} {
 	var res = make(map[string]interface{})
 
-	res["invalid"] = cfg.Folders()[folder].Invalid
+	res["invalid"] = "" // Deprecated, retains external API for now
 
 	globalFiles, globalDeleted, globalBytes := m.GlobalSize(folder)
 	res["globalFiles"], res["globalDeleted"], res["globalBytes"] = globalFiles, globalDeleted, globalBytes
@@ -634,10 +616,11 @@ func folderSummary(cfg configIntf, m modelIntf, folder string) map[string]interf
 		res["error"] = err.Error()
 	}
 
-	lv, _ := m.CurrentLocalVersion(folder)
-	rv, _ := m.RemoteLocalVersion(folder)
+	ourSeq, _ := m.CurrentSequence(folder)
+	remoteSeq, _ := m.RemoteSequence(folder)
 
-	res["version"] = lv + rv
+	res["version"] = ourSeq + remoteSeq  // legacy
+	res["sequence"] = ourSeq + remoteSeq // new name
 
 	ignorePatterns, _, _ := m.GetIgnores(folder)
 	res["ignorePatterns"] = false
@@ -728,7 +711,7 @@ func (s *apiService) postSystemConfig(w http.ResponseWriter, r *http.Request) {
 	to, err := config.ReadJSON(r.Body, myID)
 	r.Body.Close()
 	if err != nil {
-		l.Warnln("decoding posted config:", err)
+		l.Warnln("Decoding posted config:", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -760,13 +743,19 @@ func (s *apiService) postSystemConfig(w http.ResponseWriter, r *http.Request) {
 
 	// Activate and save
 
-	resp := s.cfg.Replace(to)
-	configInSync = !resp.RequiresRestart
-	s.cfg.Save()
+	if err := s.cfg.Replace(to); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if err := s.cfg.Save(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 }
 
 func (s *apiService) getSystemConfigInsync(w http.ResponseWriter, r *http.Request) {
-	sendJSON(w, map[string]bool{"configInSync": configInSync})
+	sendJSON(w, map[string]bool{"configInSync": !s.cfg.RequiresRestart()})
 }
 
 func (s *apiService) postSystemRestart(w http.ResponseWriter, r *http.Request) {
@@ -851,7 +840,6 @@ func (s *apiService) getSystemStatus(w http.ResponseWriter, r *http.Request) {
 	res["pathSeparator"] = string(filepath.Separator)
 	res["uptime"] = int(time.Since(startTime).Seconds())
 	res["startTime"] = startTime
-	res["themes"] = s.themes
 
 	sendJSON(w, res)
 }
@@ -1110,7 +1098,7 @@ func (s *apiService) postDBScan(w http.ResponseWriter, r *http.Request) {
 		}
 
 		subs := qs["sub"]
-		err = s.model.ScanFolderSubs(folder, subs)
+		err = s.model.ScanFolderSubdirs(folder, subs)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
@@ -1173,9 +1161,9 @@ func (s *apiService) getPeerCompletion(w http.ResponseWriter, r *http.Request) {
 func (s *apiService) getSystemBrowse(w http.ResponseWriter, r *http.Request) {
 	qs := r.URL.Query()
 	current := qs.Get("current")
-	if current == "" && runtime.GOOS == "windows" {
-		if drives, err := osutil.GetDriveLetters(); err == nil {
-			sendJSON(w, drives)
+	if current == "" {
+		if roots, err := osutil.GetFilesystemRoots(); err == nil {
+			sendJSON(w, roots)
 		} else {
 			http.Error(w, err.Error(), 500)
 		}
@@ -1187,148 +1175,41 @@ func (s *apiService) getSystemBrowse(w http.ResponseWriter, r *http.Request) {
 		search = search + pathSeparator
 	}
 	subdirectories, _ := osutil.Glob(search + "*")
-	ret := make([]string, 0, 10)
+	ret := make([]string, 0, len(subdirectories))
 	for _, subdirectory := range subdirectories {
 		info, err := os.Stat(subdirectory)
 		if err == nil && info.IsDir() {
 			ret = append(ret, subdirectory+pathSeparator)
-			if len(ret) > 9 {
-				break
-			}
 		}
 	}
 
 	sendJSON(w, ret)
 }
 
-type embeddedStatic struct {
-	theme        string
-	lastModified time.Time
-	mut          sync.RWMutex
-	assetDir     string
-	assets       map[string][]byte
+func (s *apiService) getCPUProf(w http.ResponseWriter, r *http.Request) {
+	duration, err := time.ParseDuration(r.FormValue("duration"))
+	if err != nil {
+		duration = 30 * time.Second
+	}
+
+	filename := fmt.Sprintf("syncthing-cpu-%s-%s-%s-%s.pprof", runtime.GOOS, runtime.GOARCH, Version, time.Now().Format("150405")) // hhmmss
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", "attachment; filename="+filename)
+
+	pprof.StartCPUProfile(w)
+	time.Sleep(duration)
+	pprof.StopCPUProfile()
 }
 
-func (s embeddedStatic) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	file := r.URL.Path
+func (s *apiService) getHeapProf(w http.ResponseWriter, r *http.Request) {
+	filename := fmt.Sprintf("syncthing-heap-%s-%s-%s-%s.pprof", runtime.GOOS, runtime.GOARCH, Version, time.Now().Format("150405")) // hhmmss
 
-	if file[0] == '/' {
-		file = file[1:]
-	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", "attachment; filename="+filename)
 
-	if len(file) == 0 {
-		file = "index.html"
-	}
-
-	s.mut.RLock()
-	theme := s.theme
-	modified := s.lastModified
-	s.mut.RUnlock()
-
-	// Check for an override for the current theme.
-	if s.assetDir != "" {
-		p := filepath.Join(s.assetDir, s.theme, filepath.FromSlash(file))
-		if _, err := os.Stat(p); err == nil {
-			http.ServeFile(w, r, p)
-			return
-		}
-	}
-
-	// Check for a compiled in asset for the current theme.
-	bs, ok := s.assets[theme+"/"+file]
-	if !ok {
-		// Check for an overridden default asset.
-		if s.assetDir != "" {
-			p := filepath.Join(s.assetDir, config.DefaultTheme, filepath.FromSlash(file))
-			if _, err := os.Stat(p); err == nil {
-				http.ServeFile(w, r, p)
-				return
-			}
-		}
-
-		// Check for a compiled in default asset.
-		bs, ok = s.assets[config.DefaultTheme+"/"+file]
-		if !ok {
-			http.NotFound(w, r)
-			return
-		}
-	}
-
-	modifiedSince, err := http.ParseTime(r.Header.Get("If-Modified-Since"))
-	if err == nil && !modified.After(modifiedSince) {
-		w.WriteHeader(http.StatusNotModified)
-		return
-	}
-
-	mtype := s.mimeTypeForFile(file)
-	if len(mtype) != 0 {
-		w.Header().Set("Content-Type", mtype)
-	}
-	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-		w.Header().Set("Content-Encoding", "gzip")
-	} else {
-		// ungzip if browser not send gzip accepted header
-		var gr *gzip.Reader
-		gr, _ = gzip.NewReader(bytes.NewReader(bs))
-		bs, _ = ioutil.ReadAll(gr)
-		gr.Close()
-	}
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(bs)))
-	w.Header().Set("Last-Modified", modified.UTC().Format(http.TimeFormat))
-	// Strictly, no-cache means the same as this. However FF and IE treat no-cache as
-	// "don't hold a local cache at all", whereas everyone seems to treat this as
-	// you can hold a local cache, but you must revalidate it before using it.
-	w.Header().Set("Cache-Control", "max-age=0, must-revalidate")
-
-	w.Write(bs)
-}
-
-func (s embeddedStatic) mimeTypeForFile(file string) string {
-	// We use a built in table of the common types since the system
-	// TypeByExtension might be unreliable. But if we don't know, we delegate
-	// to the system.
-	ext := filepath.Ext(file)
-	switch ext {
-	case ".htm", ".html":
-		return "text/html"
-	case ".css":
-		return "text/css"
-	case ".js":
-		return "application/javascript"
-	case ".json":
-		return "application/json"
-	case ".png":
-		return "image/png"
-	case ".ttf":
-		return "application/x-font-ttf"
-	case ".woff":
-		return "application/x-font-woff"
-	case ".svg":
-		return "image/svg+xml"
-	default:
-		return mime.TypeByExtension(ext)
-	}
-}
-
-// VerifyConfiguration implements the config.Committer interface
-func (s *embeddedStatic) VerifyConfiguration(from, to config.Configuration) error {
-	return nil
-}
-
-// CommitConfiguration implements the config.Committer interface
-func (s *embeddedStatic) CommitConfiguration(from, to config.Configuration) bool {
-	s.mut.Lock()
-	if s.theme != to.GUI.Theme {
-		s.theme = to.GUI.Theme
-		s.lastModified = time.Now()
-	}
-	s.mut.Unlock()
-
-	return true
-}
-
-func (s *embeddedStatic) String() string {
-	return fmt.Sprintf("embeddedStatic@%p", s)
+	runtime.GC()
+	pprof.WriteHeapProfile(w)
 }
 
 func (s *apiService) toNeedSlice(fs []db.FileInfoTruncated) []jsonDBFileInfo {
@@ -1345,13 +1226,17 @@ type jsonFileInfo protocol.FileInfo
 
 func (f jsonFileInfo) MarshalJSON() ([]byte, error) {
 	return json.Marshal(map[string]interface{}{
-		"name":         f.Name,
-		"size":         protocol.FileInfo(f).Size(),
-		"flags":        fmt.Sprintf("%#o", f.Flags),
-		"modified":     time.Unix(f.Modified, 0),
-		"localVersion": f.LocalVersion,
-		"numBlocks":    len(f.Blocks),
-		"version":      jsonVersionVector(f.Version),
+		"name":          f.Name,
+		"type":          f.Type,
+		"size":          f.Size,
+		"permissions":   fmt.Sprintf("%#o", f.Permissions),
+		"deleted":       f.Deleted,
+		"invalid":       f.Invalid,
+		"noPermissions": f.NoPermissions,
+		"modified":      time.Unix(f.Modified, 0),
+		"sequence":      f.Sequence,
+		"numBlocks":     len(f.Blocks),
+		"version":       jsonVersionVector(f.Version),
 	})
 }
 
@@ -1359,20 +1244,23 @@ type jsonDBFileInfo db.FileInfoTruncated
 
 func (f jsonDBFileInfo) MarshalJSON() ([]byte, error) {
 	return json.Marshal(map[string]interface{}{
-		"name":         f.Name,
-		"size":         db.FileInfoTruncated(f).Size(),
-		"flags":        fmt.Sprintf("%#o", f.Flags),
-		"modified":     time.Unix(f.Modified, 0),
-		"localVersion": f.LocalVersion,
-		"version":      jsonVersionVector(f.Version),
+		"name":          f.Name,
+		"type":          f.Type,
+		"size":          f.Size,
+		"permissions":   fmt.Sprintf("%#o", f.Permissions),
+		"deleted":       f.Deleted,
+		"invalid":       f.Invalid,
+		"noPermissions": f.NoPermissions,
+		"modified":      time.Unix(f.Modified, 0),
+		"sequence":      f.Sequence,
 	})
 }
 
 type jsonVersionVector protocol.Vector
 
 func (v jsonVersionVector) MarshalJSON() ([]byte, error) {
-	res := make([]string, len(v))
-	for i, c := range v {
+	res := make([]string, len(v.Counters))
+	for i, c := range v.Counters {
 		res[i] = fmt.Sprintf("%v:%d", c.ID, c.Value)
 	}
 	return json.Marshal(res)
