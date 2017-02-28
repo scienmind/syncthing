@@ -1,6 +1,6 @@
 .\" Man page generated from reStructuredText.
 .
-.TH "SYNCTHING-BEP" "7" "July 27, 2016" "v0.14" "Syncthing"
+.TH "SYNCTHING-BEP" "7" "February 22, 2017" "v0.14" "Syncthing"
 .SH NAME
 syncthing-bep \- Block Exchange Protocol v1
 .
@@ -32,14 +32,14 @@ level margin: \\n[rst2man-indent\\n[rst2man-indent-level]]
 ..
 .SH INTRODUCTION AND DEFINITIONS
 .sp
-BEP is used between two or more \fIdevices\fP thus forming a \fIcluster\fP\&. Each
-device has one or more \fIfolders\fP of files described by the \fIlocal
-model\fP, containing metadata and block hashes. The local model is sent to
-the other devices in the cluster. The union of all files in the local
-models, with files selected for highest change version, forms the
-\fIglobal model\fP\&. Each device strives to get its folders in sync with the
-global model by requesting missing or outdated blocks from the other
-devices in the cluster.
+The Block Exchange Protocol (BEP) is used between two or more \fIdevices\fP thus
+forming a \fIcluster\fP\&. Each device has one or more \fIfolders\fP of files
+described by the \fIlocal model\fP, containing metadata and block hashes. The
+local model is sent to the other devices in the cluster. The union of all
+files in the local models, with files selected for highest change version,
+forms the \fIglobal model\fP\&. Each device strives to get its folders in sync
+with the global model by requesting missing or outdated blocks from the
+other devices in the cluster.
 .sp
 File data is described and transferred in units of \fIblocks\fP, each being
 128 KiB (131072 bytes) in size.
@@ -290,14 +290,15 @@ message Folder {
 }
 
 message Device {
-    bytes           id                = 1;
-    string          name              = 2;
-    repeated string addresses         = 3;
-    Compression     compression       = 4;
-    string          cert_name         = 5;
-    int64           max_local_version = 6;
-    bool            introducer        = 7;
-    uint64          index_id          = 8;
+    bytes           id                         = 1;
+    string          name                       = 2;
+    repeated string addresses                  = 3;
+    Compression     compression                = 4;
+    string          cert_name                  = 5;
+    int64           max_sequence               = 6;
+    bool            introducer                 = 7;
+    uint64          index_id                   = 8;
+    bool            skip_introduction_removals = 9;
 }
 
 enum Compression {
@@ -365,15 +366,18 @@ Compress always. Metadata messages as well as Response messages are compressed.
 The \fBcert name\fP field indicates the expected certificate name for this
 device. It is commonly blank, indicating to use the implementation default.
 .sp
-The \fBmax local version\fP field contains the highest local file version
-number of the files in the index. See \fI\%Delta Index Exchange\fP for the usage of this
-field.
+The \fBmax sequence\fP field contains the highest sequence number of the files
+in the index. See \fI\%Delta Index Exchange\fP for the usage of this field.
 .sp
 The \fBintroducer\fP field is set for devices that are trusted as cluster
 introducers.
 .sp
 The \fBindex id\fP field contains the unique identifier for the current set of
 index data. See \fI\%Delta Index Exchange\fP for the usage of this field.
+.sp
+The \fBskip introduction removals\fP field signifies if the remote device has
+opted to ignore introduction removals for the given device. This setting is
+copied across as we are being introduced to a new device.
 .SS Index and Index Update
 .sp
 The Index and Index Update messages define the contents of the senders
@@ -381,7 +385,7 @@ folder. An Index message represents the full contents of the folder and
 thus supersedes any previous index. An Index Update amends an existing
 index with new information, not affecting any entries not included in
 the message. An Index Update MAY NOT be sent unless preceded by an
-Index, unless a non\-zero Max Local Version has been announced for the
+Index, unless a non\-zero Max Sequence has been announced for the
 given folder by the peer device.
 .sp
 The Index and Index Update messages are currently identical in format,
@@ -407,22 +411,25 @@ message FileInfo {
     FileInfoType type           = 2;
     int64        size           = 3;
     uint32       permissions    = 4;
-    int64        modified       = 5;
+    int64        modified_s     = 5;
+    int32        modified_ns    = 11;
+    uint64       modified_by    = 12;
     bool         deleted        = 6;
     bool         invalid        = 7;
     bool         no_permissions = 8;
     Vector       version        = 9;
-    int64        local_version  = 10;
+    int64        sequence      = 10;
 
-    repeated BlockInfo Blocks = 16;
+    repeated BlockInfo Blocks         = 16;
+    string             symlink_target = 17;
 }
 
 enum FileInfoType {
     FILE              = 0;
     DIRECTORY         = 1;
-    SYMLINK_FILE      = 2;
-    SYMLINK_DIRECTORY = 3;
-    SYMLINK_UNKNOWN   = 4;
+    SYMLINK_FILE      = 2 [deprecated = true];
+    SYMLINK_DIRECTORY = 3 [deprecated = true];
+    SYMLINK           = 4;
 }
 
 message BlockInfo {
@@ -458,21 +465,23 @@ operating system conventions. The combination of folder and name uniquely
 identifies each file in a cluster.
 .sp
 The \fBtype\fP field contains the type of the described item. The type is one
-of \fBfile (0)\fP, \fBdirectory (1)\fP, \fBsymlink to file (2)\fP, \fBsymlink to
-directory (3)\fP, or \fBsymlink to unknown target (4)\fP\&. The distinction
-between the various types of symlinks is not required on all operating
-systems \- the implementation SHOULD nonetheless indicate the target type
-when possible.
+of \fBfile (0)\fP, \fBdirectory (1)\fP, or \fBsymlink (4)\fP\&.
 .sp
 The \fBsize\fP field contains the size of the file, in bytes. For directories
-the size is zero. For symlinks the size is the length of the target name.
+and symlinks the size is zero.
 .sp
 The \fBpermissions\fP field holds the common Unix permission bits. An
 implementation MAY ignore or interpret these as is suitable on the host
 operating system.
 .sp
-The \fBmodified\fP time is expressed as the number of seconds since the Unix
-Epoch (1970\-01\-01 00:00:00 UTC).
+The \fBmodified_s\fP time is expressed as the number of seconds since the Unix
+Epoch (1970\-01\-01 00:00:00 UTC). The \fBmodified_ns\fP field holds the
+nanosecond part of the modification time.
+.sp
+The \fBmodified_by\fP field holds the short id of the client that last made
+any modification to the file whether add, change or delete.  This will be
+overwritten every time a change is made to the file by the last client to do
+so and so does not hold history.
 .sp
 The \fBdeleted\fP field is set when the file has been deleted. The block list
 SHALL be of length zero and the modification time indicates the time of
@@ -496,13 +505,17 @@ Value is a simple incrementing counter, starting at zero. The combination of
 Folder, Name and Version uniquely identifies the contents of a file at a
 given point in time.
 .sp
-The \fBlocal version\fP field is the value of a device local monotonic clock
-at the time of last local database update to a file. The clock ticks on
-every local database update.
+The \fBsequence\fP field is the value of a device local monotonic clock at the
+time of last local database update to a file. The clock ticks on every local
+database update, thus forming a sequence number over database updates.
 .sp
 The \fBblocks\fP list contains the size and hash for each block in the file.
 Each block represents a 128 KiB slice of the file, except for the last block
-which may represent a smaller amount of data.
+which may represent a smaller amount of data. The block list is empty for
+files and symlinks.
+.sp
+The \fBsymlink_target\fP field contains the symlink target, for entries of
+symlink type. It is empty for all other entry types.
 .SS Request
 .sp
 The Request message expresses the desire to receive a data block
@@ -737,9 +750,9 @@ directions.
 .fi
 .UNINDENT
 .UNINDENT
-.SS Read Only
+.SS Send Only
 .sp
-In read only mode, a device does not apply any updates from the cluster, but
+In send\-only mode, a device does not apply any updates from the cluster, but
 publishes changes of its local folder to the cluster as usual. The local
 folder can be seen as a "master copy" that is never affected by the actions
 of other cluster devices.
@@ -770,43 +783,43 @@ index data.
 For situations with large indexes or frequent reconnects this can be quite
 inefficient. A mechanism can then be used to retain index data between
 connections and only transmit any changes since that data on connection
-start. This is called "delta indexes". To enable this mechanism the \fBlocal
-version\fP and \fBindex ID\fP fields are used.
+start. This is called "delta indexes". To enable this mechanism the
+\fBsequence\fP and \fBindex ID\fP fields are used.
 .INDENT 0.0
 .TP
-.B Local Version:
-Each index item (i.e., file, directory or symlink) has a local version
+.B Sequence:
+Each index item (i.e., file, directory or symlink) has a sequence number
 field. It contains the value of a counter at the time the index item was
 updated. The counter increments by one for each change. That is, as files
-are scanned and added to the index they get assigned local version numbers
-1, 2, 3 and so on. The next file to be changed or detected gets local
-version number 4, and future updates continue in the same fashion.
+are scanned and added to the index they get assigned sequence numbers
+1, 2, 3 and so on. The next file to be changed or detected gets sequence
+number 4, and future updates continue in the same fashion.
 .TP
 .B Index ID:
 Each folder has an Index ID. This is a 64 bit random identifier set at
 index creation time.
 .UNINDENT
 .sp
-Given the above, we know that the tuple {index ID, maximum local version}
+Given the above, we know that the tuple {index ID, maximum sequence number}
 uniquely identifies a point in time of a given index. Any further changes
-will increase the local version of some item, and thus the maximum local
-version for the index itself. Should the index be reset or removed (i.e.,
-the local version number reset to zero), a new index ID must be generated.
+will increase the sequence number of some item, and thus the maximum
+sequence number for the index itself. Should the index be reset or removed
+(i.e., the sequence number reset to zero), a new index ID must be generated.
 .sp
-By letting a device know the {index ID, maximum local version} we have for
+By letting a device know the {index ID, maximum sequence number} we have for
 their index data, that device can arrange to only transmit \fBIndex Update\fP
-messages for items with a higher local version number. This is the delta
-index mechanism.
+messages for items with a higher sequence number. This is the delta index
+mechanism.
 .sp
-The index ID and maximum local version known for each device is transmitted
-in the \fBCluster Config\fP message at connection start.
+The index ID and maximum sequence number known for each device is
+transmitted in the \fBCluster Config\fP message at connection start.
 .sp
 For this mechanism to be reliable it is essential that outgoing index
-information is ordered by increasing local version number. Devices
-announcing a non\-zero index ID in the \fBCluster Config\fP message MUST send
-all index data ordered by increasing local version number. Devices not
-intending to participate in delta index exchange MUST send a zero index ID
-or, equivalently, not send the \fBindex_id\fP attribute at all.
+information is ordered by increasing sequence number. Devices announcing a
+non\-zero index ID in the \fBCluster Config\fP message MUST send all index data
+ordered by increasing sequence number. Devices not intending to participate
+in delta index exchange MUST send a zero index ID or, equivalently, not send
+the \fBindex_id\fP attribute at all.
 .SH MESSAGE LIMITS
 .sp
 An implementation MAY impose reasonable limits on the length of messages and

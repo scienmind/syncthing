@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // Package db provides a set type to track local/remote files with newness
 // checks. We must do a certain amount of normalization in here. We will get
@@ -16,6 +16,7 @@ import (
 	stdsync "sync"
 	"sync/atomic"
 
+	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/sync"
@@ -50,11 +51,17 @@ type FileIntf interface {
 // continue iteration, false to stop.
 type Iterator func(f FileIntf) bool
 
+type Counts struct {
+	Files       int
+	Directories int
+	Symlinks    int
+	Deleted     int
+	Bytes       int64
+}
+
 type sizeTracker struct {
-	files   int
-	deleted int
-	bytes   int64
-	mut     stdsync.Mutex
+	Counts
+	mut stdsync.Mutex
 }
 
 func (s *sizeTracker) addFile(f FileIntf) {
@@ -63,12 +70,17 @@ func (s *sizeTracker) addFile(f FileIntf) {
 	}
 
 	s.mut.Lock()
-	if f.IsDeleted() {
-		s.deleted++
-	} else {
-		s.files++
+	switch {
+	case f.IsDeleted():
+		s.Deleted++
+	case f.IsDirectory() && !f.IsSymlink():
+		s.Directories++
+	case f.IsSymlink():
+		s.Symlinks++
+	default:
+		s.Files++
 	}
-	s.bytes += f.FileSize()
+	s.Bytes += f.FileSize()
 	s.mut.Unlock()
 }
 
@@ -78,22 +90,27 @@ func (s *sizeTracker) removeFile(f FileIntf) {
 	}
 
 	s.mut.Lock()
-	if f.IsDeleted() {
-		s.deleted--
-	} else {
-		s.files--
+	switch {
+	case f.IsDeleted():
+		s.Deleted--
+	case f.IsDirectory() && !f.IsSymlink():
+		s.Directories--
+	case f.IsSymlink():
+		s.Symlinks--
+	default:
+		s.Files--
 	}
-	s.bytes -= f.FileSize()
-	if s.deleted < 0 || s.files < 0 {
+	s.Bytes -= f.FileSize()
+	if s.Deleted < 0 || s.Files < 0 || s.Directories < 0 || s.Symlinks < 0 {
 		panic("bug: removed more than added")
 	}
 	s.mut.Unlock()
 }
 
-func (s *sizeTracker) Size() (files, deleted int, bytes int64) {
+func (s *sizeTracker) Size() Counts {
 	s.mut.Lock()
 	defer s.mut.Unlock()
-	return s.files, s.deleted, s.bytes
+	return s.Counts
 }
 
 func NewFileSet(folder string, db *Instance) *FileSet {
@@ -258,11 +275,11 @@ func (s *FileSet) Sequence(device protocol.DeviceID) int64 {
 	return s.remoteSequence[device]
 }
 
-func (s *FileSet) LocalSize() (files, deleted int, bytes int64) {
+func (s *FileSet) LocalSize() Counts {
 	return s.localSize.Size()
 }
 
-func (s *FileSet) GlobalSize() (files, deleted int, bytes int64) {
+func (s *FileSet) GlobalSize() Counts {
 	return s.globalSize.Size()
 }
 
@@ -283,6 +300,24 @@ func (s *FileSet) SetIndexID(device protocol.DeviceID, id protocol.IndexID) {
 	s.db.setIndexID(device[:], []byte(s.folder), id)
 }
 
+func (s *FileSet) MtimeFS() *fs.MtimeFS {
+	prefix := s.db.mtimesKey([]byte(s.folder))
+	kv := NewNamespacedKV(s.db, string(prefix))
+	return fs.NewMtimeFS(kv)
+}
+
+func (s *FileSet) ListDevices() []protocol.DeviceID {
+	s.updateMutex.Lock()
+	devices := make([]protocol.DeviceID, 0, len(s.remoteSequence))
+	for id, seq := range s.remoteSequence {
+		if seq > 0 {
+			devices = append(devices, id)
+		}
+	}
+	s.updateMutex.Unlock()
+	return devices
+}
+
 // maxSequence returns the highest of the Sequence numbers found in
 // the given slice of FileInfos. This should really be the Sequence of
 // the last item, but Syncthing v0.14.0 and other implementations may not
@@ -301,12 +336,12 @@ func maxSequence(fs []protocol.FileInfo) int64 {
 // database.
 func DropFolder(db *Instance, folder string) {
 	db.dropFolder([]byte(folder))
+	db.dropMtimes([]byte(folder))
 	bm := &BlockMap{
 		db:     db,
 		folder: db.folderIdx.ID([]byte(folder)),
 	}
 	bm.Drop()
-	NewVirtualMtimeRepo(db, folder).Drop()
 }
 
 func normalizeFilenames(fs []protocol.FileInfo) {

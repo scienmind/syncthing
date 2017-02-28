@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package scanner
 
@@ -23,7 +23,6 @@ import (
 	"github.com/syncthing/syncthing/lib/ignore"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
-	"github.com/syncthing/syncthing/lib/symlinks"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -148,7 +147,7 @@ func TestVerify(t *testing.T) {
 	progress := newByteCounter()
 	defer progress.Close()
 
-	blocks, err := Blocks(buf, blocksize, -1, progress)
+	blocks, err := Blocks(buf, blocksize, -1, progress, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,18 +281,18 @@ func TestIssue1507(t *testing.T) {
 }
 
 func TestWalkSymlink(t *testing.T) {
-	if !symlinks.Supported {
+	if runtime.GOOS == "windows" {
 		t.Skip("skipping unsupported symlink test")
 		return
 	}
 
 	// Create a folder with a symlink in it
 
-	osutil.RemoveAll("_symlinks")
-	defer osutil.RemoveAll("_symlinks")
+	os.RemoveAll("_symlinks")
+	defer os.RemoveAll("_symlinks")
 
 	os.Mkdir("_symlinks", 0755)
-	symlinks.Create("_symlinks/link", "destination", symlinks.TargetUnknown)
+	os.Symlink("destination", "_symlinks/link")
 
 	// Scan it
 
@@ -311,23 +310,16 @@ func TestWalkSymlink(t *testing.T) {
 		files = append(files, f)
 	}
 
-	// Verify that we got one symlink and with the correct block contents
+	// Verify that we got one symlink and with the correct attributes
 
 	if len(files) != 1 {
 		t.Errorf("expected 1 symlink, not %d", len(files))
 	}
-	if len(files[0].Blocks) != 1 {
-		t.Errorf("expected 1 block, not %d", len(files[0].Blocks))
+	if len(files[0].Blocks) != 0 {
+		t.Errorf("expected zero blocks for symlink, not %d", len(files[0].Blocks))
 	}
-
-	if files[0].Blocks[0].Size != int32(len("destination")) {
-		t.Errorf("expected block length %d, not %d", len("destination"), files[0].Blocks[0].Size)
-	}
-
-	// echo -n "destination" | openssl dgst -sha256
-	hash := "b5c755aaab1038b3d5627bbde7f47ca80c5f5c0481c6d33f04139d07aa1530e7"
-	if fmt.Sprintf("%x", files[0].Blocks[0].Hash) != hash {
-		t.Errorf("incorrect hash")
+	if files[0].SymlinkTarget != "destination" {
+		t.Errorf("expected symlink to have target destination, not %q", files[0].SymlinkTarget)
 	}
 }
 
@@ -390,34 +382,6 @@ func (l testfileList) String() string {
 	return b.String()
 }
 
-func TestSymlinkTypeEqual(t *testing.T) {
-	testcases := []struct {
-		onDiskType symlinks.TargetType
-		fiType     protocol.FileInfoType
-		equal      bool
-	}{
-		// File is only equal to file
-		{symlinks.TargetFile, protocol.FileInfoTypeSymlinkFile, true},
-		{symlinks.TargetFile, protocol.FileInfoTypeSymlinkDirectory, false},
-		{symlinks.TargetFile, protocol.FileInfoTypeSymlinkUnknown, false},
-		// Directory is only equal to directory
-		{symlinks.TargetDirectory, protocol.FileInfoTypeSymlinkFile, false},
-		{symlinks.TargetDirectory, protocol.FileInfoTypeSymlinkDirectory, true},
-		{symlinks.TargetDirectory, protocol.FileInfoTypeSymlinkUnknown, false},
-		// Unknown is equal to anything
-		{symlinks.TargetUnknown, protocol.FileInfoTypeSymlinkFile, true},
-		{symlinks.TargetUnknown, protocol.FileInfoTypeSymlinkDirectory, true},
-		{symlinks.TargetUnknown, protocol.FileInfoTypeSymlinkUnknown, true},
-	}
-
-	for _, tc := range testcases {
-		res := SymlinkTypeEqual(tc.onDiskType, protocol.FileInfo{Type: tc.fiType})
-		if res != tc.equal {
-			t.Errorf("Incorrect result %v for %v, %v", res, tc.onDiskType, tc.fiType)
-		}
-	}
-}
-
 var initOnce sync.Once
 
 const (
@@ -430,11 +394,12 @@ func BenchmarkHashFile(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		if _, err := HashFile(testdataName, protocol.BlockSize, nil); err != nil {
+		if _, err := HashFile(testdataName, protocol.BlockSize, nil, true); err != nil {
 			b.Fatal(err)
 		}
 	}
 
+	b.SetBytes(testdataSize)
 	b.ReportAllocs()
 }
 

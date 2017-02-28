@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package config
 
@@ -120,9 +120,11 @@ func (w *Wrapper) Unsubscribe(c Committer) {
 	w.mut.Unlock()
 }
 
-// Raw returns the currently wrapped Configuration object.
-func (w *Wrapper) Raw() Configuration {
-	return w.cfg
+// RawCopy returns a copy of the currently wrapped Configuration object.
+func (w *Wrapper) RawCopy() Configuration {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+	return w.cfg.Copy()
 }
 
 // Replace swaps the current configuration object for the given one.
@@ -135,6 +137,10 @@ func (w *Wrapper) Replace(cfg Configuration) error {
 
 func (w *Wrapper) replaceLocked(to Configuration) error {
 	from := w.cfg
+
+	if err := to.clean(); err != nil {
+		return err
+	}
 
 	for _, sub := range w.subs {
 		l.Debugln(sub, "verifying configuration")
@@ -155,7 +161,7 @@ func (w *Wrapper) replaceLocked(to Configuration) error {
 
 func (w *Wrapper) notifyListeners(from, to Configuration) {
 	for _, sub := range w.subs {
-		go w.notifyListener(sub, from, to)
+		go w.notifyListener(sub, from.Copy(), to.Copy())
 	}
 }
 
@@ -198,6 +204,27 @@ func (w *Wrapper) SetDevice(dev DeviceConfiguration) error {
 	}
 	if !replaced {
 		newCfg.Devices = append(w.cfg.Devices, dev)
+	}
+
+	return w.replaceLocked(newCfg)
+}
+
+// RemoveDevice removes the device from the configuration
+func (w *Wrapper) RemoveDevice(id protocol.DeviceID) error {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+
+	newCfg := w.cfg.Copy()
+	removed := false
+	for i := range newCfg.Devices {
+		if newCfg.Devices[i].DeviceID == id {
+			newCfg.Devices = append(newCfg.Devices[:i], newCfg.Devices[i+1:]...)
+			removed = true
+			break
+		}
+	}
+	if !removed {
+		return nil
 	}
 
 	return w.replaceLocked(newCfg)
@@ -284,19 +311,46 @@ func (w *Wrapper) IgnoredDevice(id protocol.DeviceID) bool {
 	return false
 }
 
+// Device returns the configuration for the given device and an "ok" bool.
+func (w *Wrapper) Device(id protocol.DeviceID) (DeviceConfiguration, bool) {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+	for _, device := range w.cfg.Devices {
+		if device.DeviceID == id {
+			return device, true
+		}
+	}
+	return DeviceConfiguration{}, false
+}
+
+// Folder returns the configuration for the given folder and an "ok" bool.
+func (w *Wrapper) Folder(id string) (FolderConfiguration, bool) {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+	for _, folder := range w.cfg.Folders {
+		if folder.ID == id {
+			return folder, true
+		}
+	}
+	return FolderConfiguration{}, false
+}
+
 // Save writes the configuration to disk, and generates a ConfigSaved event.
 func (w *Wrapper) Save() error {
-	fd, err := osutil.CreateAtomic(w.path, 0600)
+	fd, err := osutil.CreateAtomic(w.path)
 	if err != nil {
+		l.Debugln("CreateAtomic:", err)
 		return err
 	}
 
 	if err := w.cfg.WriteXML(fd); err != nil {
+		l.Debugln("WriteXML:", err)
 		fd.Close()
 		return err
 	}
 
 	if err := fd.Close(); err != nil {
+		l.Debugln("Close:", err)
 		return err
 	}
 

@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package main
 
@@ -169,7 +169,7 @@ func (c *folderSummaryService) foldersToHandle() []string {
 	c.lastEventReqMut.Lock()
 	last := c.lastEventReq
 	c.lastEventReqMut.Unlock()
-	if time.Since(last) > pingEventInterval {
+	if time.Since(last) > defaultEventTimeout {
 		return nil
 	}
 
@@ -207,9 +207,11 @@ func (c *folderSummaryService) sendSummary(folder string) {
 		// remote device.
 		comp := c.model.Completion(devCfg.DeviceID, folder)
 		events.Default.Log(events.FolderCompletion, map[string]interface{}{
-			"folder":     folder,
-			"device":     devCfg.DeviceID.String(),
-			"completion": comp,
+			"folder":      folder,
+			"device":      devCfg.DeviceID.String(),
+			"completion":  comp.CompletionPct,
+			"needBytes":   comp.NeedBytes,
+			"globalBytes": comp.GlobalBytes,
 		})
 	}
 }

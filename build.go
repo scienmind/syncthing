@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // +build ignore
 
@@ -13,6 +13,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -26,7 +27,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"text/template"
 	"time"
 )
@@ -43,12 +43,12 @@ var (
 )
 
 type target struct {
-	name         string
-	buildPkg     string
-	binaryName   string
-	archiveFiles []archiveFile
-	debianFiles  []archiveFile
-	tags         []string
+	name              string
+	buildPkg          string
+	binaryName        string
+	archiveFiles      []archiveFile
+	installationFiles []archiveFile
+	tags              []string
 }
 
 type archiveFile struct {
@@ -76,7 +76,7 @@ var targets = map[string]target{
 			{src: "AUTHORS", dst: "AUTHORS.txt", perm: 0644},
 			// All files from etc/ and extra/ added automatically in init().
 		},
-		debianFiles: []archiveFile{
+		installationFiles: []archiveFile{
 			{src: "{{binary}}", dst: "deb/usr/bin/{{binary}}", perm: 0755},
 			{src: "README.md", dst: "deb/usr/share/doc/syncthing/README.txt", perm: 0644},
 			{src: "LICENSE", dst: "deb/usr/share/doc/syncthing/LICENSE.txt", perm: 0644},
@@ -94,6 +94,7 @@ var targets = map[string]target{
 			{src: "etc/linux-systemd/system/syncthing@.service", dst: "deb/lib/systemd/system/syncthing@.service", perm: 0644},
 			{src: "etc/linux-systemd/system/syncthing-resume.service", dst: "deb/lib/systemd/system/syncthing-resume.service", perm: 0644},
 			{src: "etc/linux-systemd/user/syncthing.service", dst: "deb/usr/lib/systemd/user/syncthing.service", perm: 0644},
+			{src: "etc/firewall-ufw/syncthing", dst: "deb/etc/ufw/applications.d/syncthing", perm: 0644},
 		},
 	},
 	"stdiscosrv": {
@@ -106,7 +107,7 @@ var targets = map[string]target{
 			{src: "cmd/stdiscosrv/LICENSE", dst: "LICENSE.txt", perm: 0644},
 			{src: "AUTHORS", dst: "AUTHORS.txt", perm: 0644},
 		},
-		debianFiles: []archiveFile{
+		installationFiles: []archiveFile{
 			{src: "{{binary}}", dst: "deb/usr/bin/{{binary}}", perm: 0755},
 			{src: "cmd/stdiscosrv/README.md", dst: "deb/usr/share/doc/stdiscosrv/README.txt", perm: 0644},
 			{src: "cmd/stdiscosrv/LICENSE", dst: "deb/usr/share/doc/stdiscosrv/LICENSE.txt", perm: 0644},
@@ -125,7 +126,7 @@ var targets = map[string]target{
 			{src: "cmd/strelaysrv/LICENSE", dst: "LICENSE.txt", perm: 0644},
 			{src: "AUTHORS", dst: "AUTHORS.txt", perm: 0644},
 		},
-		debianFiles: []archiveFile{
+		installationFiles: []archiveFile{
 			{src: "{{binary}}", dst: "deb/usr/bin/{{binary}}", perm: 0755},
 			{src: "cmd/strelaysrv/README.md", dst: "deb/usr/share/doc/strelaysrv/README.txt", perm: 0644},
 			{src: "cmd/strelaysrv/LICENSE", dst: "deb/usr/share/doc/strelaysrv/LICENSE.txt", perm: 0644},
@@ -143,7 +144,7 @@ var targets = map[string]target{
 			{src: "cmd/strelaypoolsrv/LICENSE", dst: "LICENSE.txt", perm: 0644},
 			{src: "AUTHORS", dst: "AUTHORS.txt", perm: 0644},
 		},
-		debianFiles: []archiveFile{
+		installationFiles: []archiveFile{
 			{src: "{{binary}}", dst: "deb/usr/bin/{{binary}}", perm: 0755},
 			{src: "cmd/strelaypoolsrv/README.md", dst: "deb/usr/share/doc/relaysrv/README.txt", perm: 0644},
 			{src: "cmd/strelaypoolsrv/LICENSE", dst: "deb/usr/share/doc/relaysrv/LICENSE.txt", perm: 0644},
@@ -151,6 +152,40 @@ var targets = map[string]target{
 		},
 	},
 }
+
+var (
+	// fast linters complete in a fraction of a second and might as well be
+	// run always as part of the build
+	fastLinters = []string{
+		"deadcode",
+		"golint",
+		"ineffassign",
+		"vet",
+	}
+
+	// slow linters take several seconds and are run only as part of the
+	// "metalint" command.
+	slowLinters = []string{
+		"gosimple",
+		"staticcheck",
+		"structcheck",
+		"unused",
+		"varcheck",
+	}
+
+	// Which parts of the tree to lint
+	lintDirs = []string{".", "./lib/...", "./cmd/..."}
+
+	// Messages to ignore
+	lintExcludes = []string{
+		".pb.go",
+		"should have comment",
+		"protocol.Vector composite literal uses unkeyed fields",
+		"cli.Requires composite literal uses unkeyed fields",
+		"Use DialContext instead",   // Go 1.7
+		"os.SEEK_SET is deprecated", // Go 1.7
+	}
+)
 
 func init() {
 	// The "syncthing" target includes a few more files found in the "etc"
@@ -163,12 +198,12 @@ func init() {
 		syncthingPkg.archiveFiles = append(syncthingPkg.archiveFiles, archiveFile{src: file, dst: file, perm: 0644})
 	}
 	for _, file := range listFiles("extra") {
-		syncthingPkg.debianFiles = append(syncthingPkg.debianFiles, archiveFile{src: file, dst: "deb/usr/share/doc/syncthing/" + filepath.Base(file), perm: 0644})
+		syncthingPkg.installationFiles = append(syncthingPkg.installationFiles, archiveFile{src: file, dst: "deb/usr/share/doc/syncthing/" + filepath.Base(file), perm: 0644})
 	}
 	targets["syncthing"] = syncthingPkg
 }
 
-const minGoVersion = 1.3
+const minGoVersion = 1.5
 
 func main() {
 	log.SetOutput(os.Stdout)
@@ -201,8 +236,6 @@ func main() {
 	// which is what you want for maximum error checking during development.
 	if flag.NArg() == 0 {
 		runCommand("install", targets["all"])
-		runCommand("vet", target{})
-		runCommand("lint", target{})
 	} else {
 		// with any command given but not a target, the target is
 		// "syncthing". So "go run build.go install" is "go run build.go install
@@ -240,6 +273,7 @@ func runCommand(cmd string, target target) {
 			tags = []string{"noupgrade"}
 		}
 		install(target, tags)
+		metalint(fastLinters, lintDirs)
 
 	case "build":
 		var tags []string
@@ -247,6 +281,7 @@ func runCommand(cmd string, target target) {
 			tags = []string{"noupgrade"}
 		}
 		build(target, tags)
+		metalint(fastLinters, lintDirs)
 
 	case "test":
 		test("./lib/...", "./cmd/...")
@@ -275,28 +310,24 @@ func runCommand(cmd string, target target) {
 	case "deb":
 		buildDeb(target)
 
+	case "snap":
+		buildSnap(target)
+
 	case "clean":
 		clean()
 
 	case "vet":
-		vet("build.go")
-		vet("cmd", "lib")
+		metalint(fastLinters, lintDirs)
 
 	case "lint":
-		lint(".")
-		lint("./cmd/...")
-		lint("./lib/...")
+		metalint(fastLinters, lintDirs)
 
 	case "metalint":
-		if isGometalinterInstalled() {
-			dirs := []string{".", "./cmd/...", "./lib/..."}
-			ok := gometalinter("deadcode", dirs, "test/util.go")
-			ok = gometalinter("structcheck", dirs) && ok
-			ok = gometalinter("varcheck", dirs) && ok
-			if !ok {
-				os.Exit(1)
-			}
-		}
+		metalint(fastLinters, lintDirs)
+		metalint(slowLinters, lintDirs)
+
+	case "version":
+		fmt.Println(getVersion())
 
 	default:
 		log.Fatalf("Unknown command %q", cmd)
@@ -335,9 +366,7 @@ func checkRequiredGoVersion() (float64, bool) {
 			log.Printf("*** Couldn't parse Go version out of %q.\n*** This isn't known to work, proceed on your own risk.", vs)
 			return 0, false
 		}
-		if f < 1.5 {
-			log.Printf("*** Go version %.01f doesn't support the vendoring mechanism.\n*** Ensure correct dependencies in your $GOPATH.", f)
-		} else if f < minGoVersion {
+		if f < minGoVersion {
 			log.Fatalf("*** Go version %.01f is less than required %.01f.\n*** This is known not to work, not proceeding.", f, minGoVersion)
 		}
 		return f, true
@@ -348,14 +377,29 @@ func checkRequiredGoVersion() (float64, bool) {
 }
 
 func setup() {
-	runPrint("go", "get", "-v", "golang.org/x/tools/cmd/cover")
-	runPrint("go", "get", "-v", "golang.org/x/net/html")
-	runPrint("go", "get", "-v", "github.com/FiloSottile/gvt")
-	runPrint("go", "get", "-v", "github.com/axw/gocov/gocov")
-	runPrint("go", "get", "-v", "github.com/AlekSi/gocov-xml")
-	runPrint("go", "get", "-v", "bitbucket.org/tebeka/go2xunit")
-	runPrint("go", "get", "-v", "github.com/alecthomas/gometalinter")
-	runPrint("go", "get", "-v", "github.com/mitchellh/go-wordwrap")
+	packages := []string{
+		"github.com/alecthomas/gometalinter",
+		"github.com/AlekSi/gocov-xml",
+		"github.com/axw/gocov/gocov",
+		"github.com/FiloSottile/gvt",
+		"github.com/golang/lint/golint",
+		"github.com/gordonklaus/ineffassign",
+		"github.com/mdempsky/unconvert",
+		"github.com/mitchellh/go-wordwrap",
+		"github.com/opennota/check/cmd/...",
+		"github.com/tsenart/deadcode",
+		"golang.org/x/net/html",
+		"golang.org/x/tools/cmd/cover",
+		"honnef.co/go/simple/cmd/gosimple",
+		"honnef.co/go/staticcheck/cmd/staticcheck",
+		"honnef.co/go/unused/cmd/unused",
+	}
+	for _, pkg := range packages {
+		fmt.Println(pkg)
+		runPrint("go", "get", "-u", pkg)
+	}
+
+	runPrint("go", "install", "-v", "./vendor/github.com/gogo/protobuf/protoc-gen-gogofast")
 }
 
 func test(pkgs ...string) {
@@ -478,8 +522,8 @@ func buildDeb(target target) {
 	os.RemoveAll("deb")
 
 	// "goarch" here is set to whatever the Debian packages expect. We correct
-	// "it to what we actually know how to build and keep the Debian variant
-	// "name in "debarch".
+	// it to what we actually know how to build and keep the Debian variant
+	// name in "debarch".
 	debarch := goarch
 	switch goarch {
 	case "i386":
@@ -490,46 +534,69 @@ func buildDeb(target target) {
 
 	build(target, []string{"noupgrade"})
 
-	for i := range target.debianFiles {
-		target.debianFiles[i].src = strings.Replace(target.debianFiles[i].src, "{{binary}}", target.binaryName, 1)
-		target.debianFiles[i].dst = strings.Replace(target.debianFiles[i].dst, "{{binary}}", target.binaryName, 1)
+	for i := range target.installationFiles {
+		target.installationFiles[i].src = strings.Replace(target.installationFiles[i].src, "{{binary}}", target.binaryName, 1)
+		target.installationFiles[i].dst = strings.Replace(target.installationFiles[i].dst, "{{binary}}", target.binaryName, 1)
 	}
 
-	for _, af := range target.debianFiles {
+	for _, af := range target.installationFiles {
 		if err := copyFile(af.src, af.dst, af.perm); err != nil {
 			log.Fatal(err)
 		}
 	}
 
-	os.MkdirAll("deb/DEBIAN", 0755)
+	maintainer := "Syncthing Release Management <release@syncthing.net>"
+	debver := version
+	if strings.HasPrefix(debver, "v") {
+		debver = debver[1:]
+	}
+	runPrint("fpm", "-t", "deb", "-s", "dir", "-C", "deb",
+		"-n", "syncthing", "-v", debver, "-a", debarch,
+		"--vendor", maintainer, "-m", maintainer,
+		"-d", "libc6",
+		"-d", "procps", // because postinst script
+		"--url", "https://syncthing.net/",
+		"--description", "Open Source Continuous File Synchronization",
+		"--after-upgrade", "script/post-upgrade",
+		"--license", "MPL-2")
+}
 
-	data := map[string]string{
-		"name":    target.name,
-		"arch":    debarch,
-		"version": version[1:],
-		"date":    time.Now().Format(time.RFC1123),
+func buildSnap(target target) {
+	os.RemoveAll("snap")
+
+	tmpl, err := template.ParseFiles("snapcraft.yaml.template")
+	if err != nil {
+		log.Fatal(err)
+	}
+	f, err := os.Create("snapcraft.yaml")
+	defer f.Close()
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	debTemplateFiles := append(listFiles("debtpl/common"), listFiles("debtpl/"+target.name)...)
-	for _, file := range debTemplateFiles {
-		tpl, err := template.New(filepath.Base(file)).ParseFiles(file)
-		if err != nil {
-			log.Fatal(err)
-		}
-		outFile := filepath.Join("deb/DEBIAN", filepath.Base(file))
-		out, err := os.Create(outFile)
-		if err != nil {
-			log.Fatal(err)
-		}
-		if err := tpl.Execute(out, data); err != nil {
-			log.Fatal(err)
-		}
-		if err := out.Close(); err != nil {
-			log.Fatal(err)
-		}
-		info, _ := os.Lstat(file)
-		os.Chmod(outFile, info.Mode())
+	snaparch := goarch
+	if snaparch == "armhf" {
+		goarch = "arm"
 	}
+	snapver := version
+	if strings.HasPrefix(snapver, "v") {
+		snapver = snapver[1:]
+	}
+	snapgrade := "devel"
+	if matched, _ := regexp.MatchString(`^\d+\.\d+\.\d+(-rc.\d+)?$`, snapver); matched {
+		snapgrade = "stable"
+	}
+	err = tmpl.Execute(f, map[string]string{
+		"Version":      snapver,
+		"Architecture": snaparch,
+		"Grade":        snapgrade,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	runPrint("snapcraft", "clean")
+	build(target, []string{"noupgrade"})
+	runPrint("snapcraft")
 }
 
 func copyFile(src, dst string, perm os.FileMode) error {
@@ -585,14 +652,15 @@ func shouldRebuildAssets(target, srcdir string) bool {
 	// so we should rebuild it.
 	currentBuild := info.ModTime()
 	assetsAreNewer := false
+	stop := errors.New("no need to iterate further")
 	filepath.Walk(srcdir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		if assetsAreNewer {
-			return nil
+		if info.ModTime().After(currentBuild) {
+			assetsAreNewer = true
+			return stop
 		}
-		assetsAreNewer = info.ModTime().After(currentBuild)
 		return nil
 	})
 
@@ -641,7 +709,9 @@ func ldflags() string {
 
 func rmr(paths ...string) {
 	for _, path := range paths {
-		log.Println("rm -r", path)
+		if debug {
+			log.Println("rm -r", path)
+		}
 		os.RemoveAll(path)
 	}
 }
@@ -959,48 +1029,6 @@ func zipFile(out string, files []archiveFile) {
 	}
 }
 
-func vet(dirs ...string) {
-	params := []string{"tool", "vet", "-all"}
-	params = append(params, dirs...)
-	bs, err := runError("go", params...)
-
-	if len(bs) > 0 {
-		log.Printf("%s", bs)
-	}
-
-	if err != nil {
-		if exitStatus(err) == 3 {
-			// Exit code 3, the "vet" tool is not installed
-			return
-		}
-
-		// A genuine error exit from the vet tool.
-		log.Fatal(err)
-	}
-}
-
-func lint(pkg string) {
-	bs, err := runError("golint", pkg)
-	if err != nil {
-		log.Println(`- No golint, not linting. Try "go get -u github.com/golang/lint/golint".`)
-		return
-	}
-
-	analCommentPolicy := regexp.MustCompile(`exported (function|method|const|type|var) [^\s]+ should have comment`)
-	for _, line := range strings.Split(string(bs), "\n") {
-		if line == "" {
-			continue
-		}
-		if analCommentPolicy.MatchString(line) {
-			continue
-		}
-		if strings.Contains(line, ".pb.go:") {
-			continue
-		}
-		log.Println(line)
-	}
-}
-
 func macosCodesign(file string) {
 	if pass := os.Getenv("CODESIGN_KEYCHAIN_PASS"); pass != "" {
 		bs, err := runError("security", "unlock-keychain", "-p", pass)
@@ -1020,14 +1048,16 @@ func macosCodesign(file string) {
 	}
 }
 
-func exitStatus(err error) int {
-	if err, ok := err.(*exec.ExitError); ok {
-		if ws, ok := err.ProcessState.Sys().(syscall.WaitStatus); ok {
-			return ws.ExitStatus()
+func metalint(linters []string, dirs []string) {
+	ok := true
+	if isGometalinterInstalled() {
+		if !gometalinter(linters, dirs, lintExcludes...) {
+			ok = false
 		}
 	}
-
-	return -1
+	if !ok {
+		log.Fatal("Build succeeded, but there were lint warnings")
+	}
 }
 
 func isGometalinterInstalled() bool {
@@ -1038,10 +1068,12 @@ func isGometalinterInstalled() bool {
 	return true
 }
 
-func gometalinter(linter string, dirs []string, excludes ...string) bool {
-	params := []string{"--disable-all"}
-	params = append(params, fmt.Sprintf("--deadline=%ds", 60))
-	params = append(params, "--enable="+linter)
+func gometalinter(linters []string, dirs []string, excludes ...string) bool {
+	params := []string{"--disable-all", "--concurrency=2", "--deadline=300s"}
+
+	for _, linter := range linters {
+		params = append(params, "--enable="+linter)
+	}
 
 	for _, exclude := range excludes {
 		params = append(params, "--exclude="+exclude)
@@ -1054,14 +1086,19 @@ func gometalinter(linter string, dirs []string, excludes ...string) bool {
 	bs, _ := runError("gometalinter", params...)
 
 	nerr := 0
+	lines := make(map[string]struct{})
 	for _, line := range strings.Split(string(bs), "\n") {
 		if line == "" {
 			continue
 		}
-		if strings.Contains(line, ".pb.go:") {
+		if _, ok := lines[line]; ok {
 			continue
 		}
 		log.Println(line)
+		if strings.Contains(line, "executable file not found") {
+			log.Println(` - Try "go run build.go setup" to install missing tools`)
+		}
+		lines[line] = struct{}{}
 		nerr++
 	}
 

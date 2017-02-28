@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package main
 
@@ -53,6 +53,7 @@ type apiService struct {
 	statics            *staticsServer
 	model              modelIntf
 	eventSub           events.BufferedSubscription
+	diskEventSub       events.BufferedSubscription
 	discoverer         discover.CachingMux
 	connectionsService connectionsIntf
 	fss                *folderSummaryService
@@ -60,7 +61,7 @@ type apiService struct {
 	stop               chan struct{} // signals intentional stop
 	configChanged      chan struct{} // signals intentional listener close due to config change
 	started            chan string   // signals startup complete by sending the listener address, for testing only
-	startedOnce        bool          // the service has started successfully at least once
+	startedOnce        chan struct{} // the service has started successfully at least once
 
 	guiErrors logger.Recorder
 	systemLog logger.Recorder
@@ -68,10 +69,10 @@ type apiService struct {
 
 type modelIntf interface {
 	GlobalDirectoryTree(folder, prefix string, levels int, dirsonly bool) map[string]interface{}
-	Completion(device protocol.DeviceID, folder string) float64
+	Completion(device protocol.DeviceID, folder string) model.FolderCompletion
 	Override(folder string)
 	NeedFolderFiles(folder string, page, perpage int) ([]db.FileInfoTruncated, []db.FileInfoTruncated, []db.FileInfoTruncated, int)
-	NeedSize(folder string) (nfiles int, bytes int64)
+	NeedSize(folder string) db.Counts
 	ConnectionStats() map[string]interface{}
 	DeviceStatistics() map[string]stats.DeviceStatistics
 	FolderStatistics() map[string]stats.FolderStatistics
@@ -81,16 +82,14 @@ type modelIntf interface {
 	Availability(folder, file string, version protocol.Vector, block protocol.BlockInfo) []model.Availability
 	GetIgnores(folder string) ([]string, []string, error)
 	SetIgnores(folder string, content []string) error
-	PauseDevice(device protocol.DeviceID)
-	ResumeDevice(device protocol.DeviceID)
 	DelayScan(folder string, next time.Duration)
 	ScanFolder(folder string) error
 	ScanFolders() map[string]error
 	ScanFolderSubdirs(folder string, subs []string) error
 	BringToFront(folder, file string)
 	ConnectedTo(deviceID protocol.DeviceID) bool
-	GlobalSize(folder string) (nfiles, deleted int, bytes int64)
-	LocalSize(folder string) (nfiles, deleted int, bytes int64)
+	GlobalSize(folder string) db.Counts
+	LocalSize(folder string) db.Counts
 	CurrentSequence(folder string) (int64, bool)
 	RemoteSequence(folder string) (int64, bool)
 	State(folder string) (string, time.Time, error)
@@ -98,12 +97,13 @@ type modelIntf interface {
 
 type configIntf interface {
 	GUI() config.GUIConfiguration
-	Raw() config.Configuration
+	RawCopy() config.Configuration
 	Options() config.OptionsConfiguration
 	Replace(cfg config.Configuration) error
 	Subscribe(c config.Committer)
 	Folders() map[string]config.FolderConfiguration
 	Devices() map[protocol.DeviceID]config.DeviceConfiguration
+	SetDevice(config.DeviceConfiguration) error
 	Save() error
 	ListenAddresses() []string
 	RequiresRestart() bool
@@ -113,7 +113,7 @@ type connectionsIntf interface {
 	Status() map[string]interface{}
 }
 
-func newAPIService(id protocol.DeviceID, cfg configIntf, httpsCertFile, httpsKeyFile, assetDir string, m modelIntf, eventSub events.BufferedSubscription, discoverer discover.CachingMux, connectionsService connectionsIntf, errors, systemLog logger.Recorder) *apiService {
+func newAPIService(id protocol.DeviceID, cfg configIntf, httpsCertFile, httpsKeyFile, assetDir string, m modelIntf, eventSub events.BufferedSubscription, diskEventSub events.BufferedSubscription, discoverer discover.CachingMux, connectionsService connectionsIntf, errors, systemLog logger.Recorder) *apiService {
 	service := &apiService{
 		id:                 id,
 		cfg:                cfg,
@@ -122,11 +122,13 @@ func newAPIService(id protocol.DeviceID, cfg configIntf, httpsCertFile, httpsKey
 		statics:            newStaticsServer(cfg.GUI().Theme, assetDir),
 		model:              m,
 		eventSub:           eventSub,
+		diskEventSub:       diskEventSub,
 		discoverer:         discoverer,
 		connectionsService: connectionsService,
 		systemConfigMut:    sync.NewMutex(),
 		stop:               make(chan struct{}),
 		configChanged:      make(chan struct{}),
+		startedOnce:        make(chan struct{}),
 		guiErrors:          errors,
 		systemLog:          systemLog,
 	}
@@ -200,26 +202,28 @@ func sendJSON(w http.ResponseWriter, jsonObject interface{}) {
 func (s *apiService) Serve() {
 	listener, err := s.getListener(s.cfg.GUI())
 	if err != nil {
-		if !s.startedOnce {
+		select {
+		case <-s.startedOnce:
+			// We let this be a loud user-visible warning as it may be the only
+			// indication they get that the GUI won't be available.
+			l.Warnln("Starting API/GUI:", err)
+			return
+
+		default:
 			// This is during initialization. A failure here should be fatal
 			// as there will be no way for the user to communicate with us
 			// otherwise anyway.
 			l.Fatalln("Starting API/GUI:", err)
 		}
-
-		// We let this be a loud user-visible warning as it may be the only
-		// indication they get that the GUI won't be available on startup.
-		l.Warnln("Starting API/GUI:", err)
-		return
 	}
-	s.startedOnce = true
-	defer listener.Close()
 
 	if listener == nil {
 		// Not much we can do here other than exit quickly. The supervisor
 		// will log an error at some point.
 		return
 	}
+
+	defer listener.Close()
 
 	// The GET handlers
 	getRestMux := http.NewServeMux()
@@ -229,7 +233,8 @@ func (s *apiService) Serve() {
 	getRestMux.HandleFunc("/rest/db/need", s.getDBNeed)                          // folder [perpage] [page]
 	getRestMux.HandleFunc("/rest/db/status", s.getDBStatus)                      // folder
 	getRestMux.HandleFunc("/rest/db/browse", s.getDBBrowse)                      // folder [prefix] [dirsonly] [levels]
-	getRestMux.HandleFunc("/rest/events", s.getEvents)                           // since [limit]
+	getRestMux.HandleFunc("/rest/events", s.getIndexEvents)                      // since [limit] [timeout]
+	getRestMux.HandleFunc("/rest/events/disk", s.getDiskEvents)                  // since [limit] [timeout]
 	getRestMux.HandleFunc("/rest/stats/device", s.getDeviceStats)                // -
 	getRestMux.HandleFunc("/rest/stats/folder", s.getFolderStats)                // -
 	getRestMux.HandleFunc("/rest/svc/deviceid", s.getDeviceID)                   // id
@@ -252,21 +257,21 @@ func (s *apiService) Serve() {
 
 	// The POST handlers
 	postRestMux := http.NewServeMux()
-	postRestMux.HandleFunc("/rest/db/prio", s.postDBPrio)                      // folder file [perpage] [page]
-	postRestMux.HandleFunc("/rest/db/ignores", s.postDBIgnores)                // folder
-	postRestMux.HandleFunc("/rest/db/override", s.postDBOverride)              // folder
-	postRestMux.HandleFunc("/rest/db/scan", s.postDBScan)                      // folder [sub...] [delay]
-	postRestMux.HandleFunc("/rest/system/config", s.postSystemConfig)          // <body>
-	postRestMux.HandleFunc("/rest/system/error", s.postSystemError)            // <body>
-	postRestMux.HandleFunc("/rest/system/error/clear", s.postSystemErrorClear) // -
-	postRestMux.HandleFunc("/rest/system/ping", s.restPing)                    // -
-	postRestMux.HandleFunc("/rest/system/reset", s.postSystemReset)            // [folder]
-	postRestMux.HandleFunc("/rest/system/restart", s.postSystemRestart)        // -
-	postRestMux.HandleFunc("/rest/system/shutdown", s.postSystemShutdown)      // -
-	postRestMux.HandleFunc("/rest/system/upgrade", s.postSystemUpgrade)        // -
-	postRestMux.HandleFunc("/rest/system/pause", s.postSystemPause)            // device
-	postRestMux.HandleFunc("/rest/system/resume", s.postSystemResume)          // device
-	postRestMux.HandleFunc("/rest/system/debug", s.postSystemDebug)            // [enable] [disable]
+	postRestMux.HandleFunc("/rest/db/prio", s.postDBPrio)                          // folder file [perpage] [page]
+	postRestMux.HandleFunc("/rest/db/ignores", s.postDBIgnores)                    // folder
+	postRestMux.HandleFunc("/rest/db/override", s.postDBOverride)                  // folder
+	postRestMux.HandleFunc("/rest/db/scan", s.postDBScan)                          // folder [sub...] [delay]
+	postRestMux.HandleFunc("/rest/system/config", s.postSystemConfig)              // <body>
+	postRestMux.HandleFunc("/rest/system/error", s.postSystemError)                // <body>
+	postRestMux.HandleFunc("/rest/system/error/clear", s.postSystemErrorClear)     // -
+	postRestMux.HandleFunc("/rest/system/ping", s.restPing)                        // -
+	postRestMux.HandleFunc("/rest/system/reset", s.postSystemReset)                // [folder]
+	postRestMux.HandleFunc("/rest/system/restart", s.postSystemRestart)            // -
+	postRestMux.HandleFunc("/rest/system/shutdown", s.postSystemShutdown)          // -
+	postRestMux.HandleFunc("/rest/system/upgrade", s.postSystemUpgrade)            // -
+	postRestMux.HandleFunc("/rest/system/pause", s.makeDevicePauseHandler(true))   // device
+	postRestMux.HandleFunc("/rest/system/resume", s.makeDevicePauseHandler(false)) // device
+	postRestMux.HandleFunc("/rest/system/debug", s.postSystemDebug)                // [enable] [disable]
 
 	// Debug endpoints, not for general use
 	debugMux := http.NewServeMux()
@@ -313,11 +318,18 @@ func (s *apiService) Serve() {
 	// Add the CORS handling
 	handler = corsMiddleware(handler)
 
+	if addressIsLocalhost(guiCfg.Address()) && !guiCfg.InsecureSkipHostCheck {
+		// Verify source host
+		handler = localhostMiddleware(handler)
+	}
+
 	handler = debugMiddleware(handler)
 
 	srv := http.Server{
-		Handler:     handler,
-		ReadTimeout: 10 * time.Second,
+		Handler: handler,
+		// ReadTimeout must be longer than SyncthingController $scope.refresh
+		// interval to avoid HTTP keepalive/GUI refresh race.
+		ReadTimeout: 15 * time.Second,
 	}
 
 	s.fss = newFolderSummaryService(s.cfg, s.model)
@@ -329,6 +341,14 @@ func (s *apiService) Serve() {
 	if s.started != nil {
 		// only set when run by the tests
 		s.started <- listener.Addr().String()
+	}
+
+	// Indicate successful initial startup, to ourselves and to interested
+	// listeners (i.e. the thing that starts the browser).
+	select {
+	case <-s.startedOnce:
+	default:
+		close(s.startedOnce)
 	}
 
 	// Serve in the background
@@ -362,10 +382,8 @@ func (s *apiService) String() string {
 }
 
 func (s *apiService) VerifyConfiguration(from, to config.Configuration) error {
-	if _, err := net.ResolveTCPAddr("tcp", to.GUI.Address()); err != nil {
-		return err
-	}
-	return nil
+	_, err := net.ResolveTCPAddr("tcp", to.GUI.Address())
+	return err
 }
 
 func (s *apiService) CommitConfiguration(from, to config.Configuration) bool {
@@ -437,10 +455,12 @@ func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Process OPTIONS requests
 		if r.Method == "OPTIONS" {
+			// Add a generous access-control-allow-origin header for CORS requests
+			w.Header().Add("Access-Control-Allow-Origin", "*")
 			// Only GET/POST Methods are supported
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST")
-			// Only this custom header can be set
-			w.Header().Set("Access-Control-Allow-Headers", "X-API-Key")
+			// Only these headers can be set
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
 			// The request is meant to be cached 10 minutes
 			w.Header().Set("Access-Control-Max-Age", "600")
 
@@ -495,6 +515,17 @@ func withDetailsMiddleware(id protocol.DeviceID, h http.Handler) http.Handler {
 	})
 }
 
+func localhostMiddleware(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if addressIsLocalhost(r.Host) {
+			h.ServeHTTP(w, r)
+			return
+		}
+
+		http.Error(w, "Host check error", http.StatusForbidden)
+	})
+}
+
 func (s *apiService) whenDebugging(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.cfg.GUI().Debugging {
@@ -503,7 +534,6 @@ func (s *apiService) whenDebugging(h http.Handler) http.Handler {
 		}
 
 		http.Error(w, "Debugging disabled", http.StatusBadRequest)
-		return
 	})
 }
 
@@ -583,8 +613,12 @@ func (s *apiService) getDBCompletion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sendJSON(w, map[string]float64{
-		"completion": s.model.Completion(device, folder),
+	comp := s.model.Completion(device, folder)
+	sendJSON(w, map[string]interface{}{
+		"completion":  comp.CompletionPct,
+		"needBytes":   comp.NeedBytes,
+		"globalBytes": comp.GlobalBytes,
+		"needDeletes": comp.NeedDeletes,
 	})
 }
 
@@ -599,16 +633,16 @@ func folderSummary(cfg configIntf, m modelIntf, folder string) map[string]interf
 
 	res["invalid"] = "" // Deprecated, retains external API for now
 
-	globalFiles, globalDeleted, globalBytes := m.GlobalSize(folder)
-	res["globalFiles"], res["globalDeleted"], res["globalBytes"] = globalFiles, globalDeleted, globalBytes
+	global := m.GlobalSize(folder)
+	res["globalFiles"], res["globalDirectories"], res["globalSymlinks"], res["globalDeleted"], res["globalBytes"] = global.Files, global.Directories, global.Symlinks, global.Deleted, global.Bytes
 
-	localFiles, localDeleted, localBytes := m.LocalSize(folder)
-	res["localFiles"], res["localDeleted"], res["localBytes"] = localFiles, localDeleted, localBytes
+	local := m.LocalSize(folder)
+	res["localFiles"], res["localDirectories"], res["localSymlinks"], res["localDeleted"], res["localBytes"] = local.Files, local.Directories, local.Symlinks, local.Deleted, local.Bytes
 
-	needFiles, needBytes := m.NeedSize(folder)
-	res["needFiles"], res["needBytes"] = needFiles, needBytes
+	need := m.NeedSize(folder)
+	res["needFiles"], res["needDirectories"], res["needSymlinks"], res["needDeletes"], res["needBytes"] = need.Files, need.Directories, need.Symlinks, need.Deleted, need.Bytes
 
-	res["inSyncFiles"], res["inSyncBytes"] = globalFiles-needFiles, globalBytes-needBytes
+	res["inSyncFiles"], res["inSyncBytes"] = global.Files-need.Files, global.Bytes-need.Bytes
 
 	var err error
 	res["state"], res["stateChanged"], err = m.State(folder)
@@ -701,7 +735,7 @@ func (s *apiService) getDBFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *apiService) getSystemConfig(w http.ResponseWriter, r *http.Request) {
-	sendJSON(w, s.cfg.Raw())
+	sendJSON(w, s.cfg.RawCopy())
 }
 
 func (s *apiService) postSystemConfig(w http.ResponseWriter, r *http.Request) {
@@ -744,11 +778,13 @@ func (s *apiService) postSystemConfig(w http.ResponseWriter, r *http.Request) {
 	// Activate and save
 
 	if err := s.cfg.Replace(to); err != nil {
+		l.Warnln("Replacing config:", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	if err := s.cfg.Save(); err != nil {
+		l.Warnln("Saving config:", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -970,14 +1006,27 @@ func (s *apiService) postDBIgnores(w http.ResponseWriter, r *http.Request) {
 	s.getDBIgnores(w, r)
 }
 
-func (s *apiService) getEvents(w http.ResponseWriter, r *http.Request) {
+func (s *apiService) getIndexEvents(w http.ResponseWriter, r *http.Request) {
+	s.fss.gotEventRequest()
+	s.getEvents(w, r, s.eventSub)
+}
+
+func (s *apiService) getDiskEvents(w http.ResponseWriter, r *http.Request) {
+	s.getEvents(w, r, s.diskEventSub)
+}
+
+func (s *apiService) getEvents(w http.ResponseWriter, r *http.Request, eventSub events.BufferedSubscription) {
 	qs := r.URL.Query()
 	sinceStr := qs.Get("since")
 	limitStr := qs.Get("limit")
+	timeoutStr := qs.Get("timeout")
 	since, _ := strconv.Atoi(sinceStr)
 	limit, _ := strconv.Atoi(limitStr)
 
-	s.fss.gotEventRequest()
+	timeout := defaultEventTimeout
+	if timeoutSec, timeoutErr := strconv.Atoi(timeoutStr); timeoutErr == nil && timeoutSec >= 0 { // 0 is a valid timeout
+		timeout = time.Duration(timeoutSec) * time.Second
+	}
 
 	// Flush before blocking, to indicate that we've received the request and
 	// that it should not be retried. Must set Content-Type header before
@@ -986,7 +1035,8 @@ func (s *apiService) getEvents(w http.ResponseWriter, r *http.Request) {
 	f := w.(http.Flusher)
 	f.Flush()
 
-	evs := s.eventSub.Since(since, nil)
+	// If there are no events available return an empty slice, as this gets serialized as `[]`
+	evs := eventSub.Since(since, []events.Event{}, timeout)
 	if 0 < limit && limit < len(evs) {
 		evs = evs[len(evs)-limit:]
 	}
@@ -995,11 +1045,12 @@ func (s *apiService) getEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *apiService) getSystemUpgrade(w http.ResponseWriter, r *http.Request) {
-	if noUpgrade {
+	if noUpgradeFromEnv {
 		http.Error(w, upgrade.ErrUpgradeUnsupported.Error(), 500)
 		return
 	}
-	rel, err := upgrade.LatestRelease(s.cfg.Options().ReleasesURL, Version)
+	opts := s.cfg.Options()
+	rel, err := upgrade.LatestRelease(opts.ReleasesURL, Version, opts.UpgradeToPreReleases)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -1040,7 +1091,8 @@ func (s *apiService) getLang(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *apiService) postSystemUpgrade(w http.ResponseWriter, r *http.Request) {
-	rel, err := upgrade.LatestRelease(s.cfg.Options().ReleasesURL, Version)
+	opts := s.cfg.Options()
+	rel, err := upgrade.LatestRelease(opts.ReleasesURL, Version, opts.UpgradeToPreReleases)
 	if err != nil {
 		l.Warnln("getting latest release:", err)
 		http.Error(w, err.Error(), 500)
@@ -1061,47 +1113,43 @@ func (s *apiService) postSystemUpgrade(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *apiService) postSystemPause(w http.ResponseWriter, r *http.Request) {
-	var qs = r.URL.Query()
-	var deviceStr = qs.Get("device")
+func (s *apiService) makeDevicePauseHandler(paused bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var qs = r.URL.Query()
+		var deviceStr = qs.Get("device")
 
-	device, err := protocol.DeviceIDFromString(deviceStr)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
+		device, err := protocol.DeviceIDFromString(deviceStr)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+
+		cfg, ok := s.cfg.Devices()[device]
+		if !ok {
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+
+		cfg.Paused = paused
+		if err := s.cfg.SetDevice(cfg); err != nil {
+			http.Error(w, err.Error(), 500)
+		}
 	}
-
-	s.model.PauseDevice(device)
-}
-
-func (s *apiService) postSystemResume(w http.ResponseWriter, r *http.Request) {
-	var qs = r.URL.Query()
-	var deviceStr = qs.Get("device")
-
-	device, err := protocol.DeviceIDFromString(deviceStr)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-
-	s.model.ResumeDevice(device)
 }
 
 func (s *apiService) postDBScan(w http.ResponseWriter, r *http.Request) {
 	qs := r.URL.Query()
 	folder := qs.Get("folder")
 	if folder != "" {
+		subs := qs["sub"]
+		err := s.model.ScanFolderSubdirs(folder, subs)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
 		nextStr := qs.Get("next")
 		next, err := strconv.Atoi(nextStr)
 		if err == nil {
 			s.model.DelayScan(folder, time.Duration(next)*time.Second)
-		}
-
-		subs := qs["sub"]
-		err = s.model.ScanFolderSubdirs(folder, subs)
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
 		}
 	} else {
 		errors := s.model.ScanFolders()
@@ -1142,7 +1190,7 @@ func (s *apiService) getPeerCompletion(w http.ResponseWriter, r *http.Request) {
 		for _, device := range folder.DeviceIDs() {
 			deviceStr := device.String()
 			if s.model.ConnectedTo(device) {
-				tot[deviceStr] += s.model.Completion(device, folder.ID)
+				tot[deviceStr] += s.model.Completion(device, folder.ID).CompletionPct
 			} else {
 				tot[deviceStr] = 0
 			}
@@ -1233,7 +1281,7 @@ func (f jsonFileInfo) MarshalJSON() ([]byte, error) {
 		"deleted":       f.Deleted,
 		"invalid":       f.Invalid,
 		"noPermissions": f.NoPermissions,
-		"modified":      time.Unix(f.Modified, 0),
+		"modified":      protocol.FileInfo(f).ModTime(),
 		"sequence":      f.Sequence,
 		"numBlocks":     len(f.Blocks),
 		"version":       jsonVersionVector(f.Version),
@@ -1251,7 +1299,7 @@ func (f jsonDBFileInfo) MarshalJSON() ([]byte, error) {
 		"deleted":       f.Deleted,
 		"invalid":       f.Invalid,
 		"noPermissions": f.NoPermissions,
-		"modified":      time.Unix(f.Modified, 0),
+		"modified":      db.FileInfoTruncated(f).ModTime(),
 		"sequence":      f.Sequence,
 	})
 }
@@ -1287,4 +1335,18 @@ func dirNames(dir string) []string {
 
 	sort.Strings(dirs)
 	return dirs
+}
+
+func addressIsLocalhost(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// There was no port, so we assume the address was just a hostname
+		host = addr
+	}
+	switch strings.ToLower(host) {
+	case "127.0.0.1", "::1", "localhost":
+		return true
+	default:
+		return false
+	}
 }

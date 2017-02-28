@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package config
 
@@ -54,7 +54,6 @@ func TestDefaultValues(t *testing.T) {
 		KeepTemporariesH:        24,
 		CacheIgnoredFiles:       false,
 		ProgressUpdateIntervalS: 5,
-		SymlinksEnabled:         true,
 		LimitBandwidthInLan:     false,
 		MinHomeDiskFreePct:      1,
 		URURL:                   "https://data.syncthing.net/newdata",
@@ -64,6 +63,8 @@ func TestDefaultValues(t *testing.T) {
 		AlwaysLocalNets:         []string{},
 		OverwriteRemoteDevNames: false,
 		TempIndexMinBlocks:      10,
+		UnackedNotificationIDs:  []string{},
+		WeakHashSelectionMethod: WeakHashAuto,
 	}
 
 	cfg := New(device1)
@@ -95,7 +96,7 @@ func TestDeviceConfig(t *testing.T) {
 				ID:              "test",
 				RawPath:         "testdata",
 				Devices:         []FolderDeviceConfiguration{{DeviceID: device1}, {DeviceID: device4}},
-				Type:            FolderTypeReadOnly,
+				Type:            FolderTypeSendOnly,
 				RescanIntervalS: 600,
 				Copiers:         0,
 				Pullers:         0,
@@ -103,6 +104,11 @@ func TestDeviceConfig(t *testing.T) {
 				AutoNormalize:   true,
 				MinDiskFreePct:  1,
 				MaxConflicts:    -1,
+				Fsync:           true,
+				Versioning: VersioningConfiguration{
+					Params: map[string]string{},
+				},
+				WeakHashThresholdPct: 25,
 			},
 		}
 
@@ -184,7 +190,6 @@ func TestOverriddenValues(t *testing.T) {
 		KeepTemporariesH:        48,
 		CacheIgnoredFiles:       true,
 		ProgressUpdateIntervalS: 10,
-		SymlinksEnabled:         false,
 		LimitBandwidthInLan:     true,
 		MinHomeDiskFreePct:      5.2,
 		URURL:                   "https://localhost/newdata",
@@ -194,8 +199,13 @@ func TestOverriddenValues(t *testing.T) {
 		AlwaysLocalNets:         []string{},
 		OverwriteRemoteDevNames: true,
 		TempIndexMinBlocks:      100,
+		UnackedNotificationIDs: []string{
+			"channelNotification", // added in 17->18 migration
+		},
+		WeakHashSelectionMethod: WeakHashNever,
 	}
 
+	os.Unsetenv("STNOUPGRADE")
 	cfg, err := Load("testdata/overridenvalues.xml", device1)
 	if err != nil {
 		t.Error(err)
@@ -451,7 +461,7 @@ func TestNewSaveLoad(t *testing.T) {
 		t.Error(err)
 	}
 
-	if diff, equal := messagediff.PrettyDiff(cfg.Raw(), cfg2.Raw()); !equal {
+	if diff, equal := messagediff.PrettyDiff(cfg.RawCopy(), cfg2.RawCopy()); !equal {
 		t.Errorf("Configs are not equal. Diff:\n%s", diff)
 	}
 
@@ -477,7 +487,7 @@ func TestCopy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := wrapper.Raw()
+	cfg := wrapper.RawCopy()
 
 	bsOrig, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -543,7 +553,7 @@ func TestPullOrder(t *testing.T) {
 	// Serialize and deserialize again to verify it survives the transformation
 
 	buf := new(bytes.Buffer)
-	cfg := wrapper.Raw()
+	cfg := wrapper.RawCopy()
 	cfg.WriteXML(buf)
 
 	t.Logf("%s", buf.Bytes())
@@ -606,7 +616,7 @@ func TestDuplicateDevices(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if l := len(wrapper.Raw().Devices); l != 3 {
+	if l := len(wrapper.RawCopy().Devices); l != 3 {
 		t.Errorf("Incorrect number of devices, %d != 3", l)
 	}
 
@@ -695,5 +705,75 @@ func TestV14ListenAddressesMigration(t *testing.T) {
 		if !reflect.DeepEqual(cfg.Options.ListenAddresses, tc[2]) {
 			t.Errorf("Migration error; actual %#v != expected %#v", cfg.Options.ListenAddresses, tc[2])
 		}
+	}
+}
+
+func TestIgnoredDevices(t *testing.T) {
+	// Verify that ignored devices that are also present in the
+	// configuration are not in fact ignored.
+
+	wrapper, err := Load("testdata/ignoreddevices.xml", device1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if wrapper.IgnoredDevice(device1) {
+		t.Errorf("Device %v should not be ignored", device1)
+	}
+	if !wrapper.IgnoredDevice(device3) {
+		t.Errorf("Device %v should be ignored", device3)
+	}
+}
+
+func TestGetDevice(t *testing.T) {
+	// Verify that the Device() call does the right thing
+
+	wrapper, err := Load("testdata/ignoreddevices.xml", device1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// device1 is mentioned in the config
+
+	device, ok := wrapper.Device(device1)
+	if !ok {
+		t.Error(device1, "should exist")
+	}
+	if device.DeviceID != device1 {
+		t.Error("Should have returned", device1, "not", device.DeviceID)
+	}
+
+	// device3 is not
+
+	device, ok = wrapper.Device(device3)
+	if ok {
+		t.Error(device3, "should not exist")
+	}
+	if device.DeviceID == device3 {
+		t.Error("Should not returned ID", device3)
+	}
+}
+
+func TestSharesRemovedOnDeviceRemoval(t *testing.T) {
+	wrapper, err := Load("testdata/example.xml", device1)
+	if err != nil {
+		t.Errorf("Failed: %s", err)
+	}
+
+	raw := wrapper.RawCopy()
+	raw.Devices = raw.Devices[:len(raw.Devices)-1]
+
+	if len(raw.Folders[0].Devices) <= len(raw.Devices) {
+		t.Error("Should have less devices")
+	}
+
+	err = wrapper.Replace(raw)
+	if err != nil {
+		t.Errorf("Failed: %s", err)
+	}
+
+	raw = wrapper.RawCopy()
+	if len(raw.Folders[0].Devices) > len(raw.Devices) {
+		t.Error("Unexpected extra device")
 	}
 }

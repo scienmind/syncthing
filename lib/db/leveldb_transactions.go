@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package db
 
@@ -128,7 +128,7 @@ func (t readWriteTransaction) updateGlobal(folder, device []byte, file protocol.
 		Version: file.Version,
 	}
 
-	insertedAt := -1
+	var insertedAt int
 	// Find a position in the list to insert this file. The file at the front
 	// of the list is the newer, the "global".
 	for i := range fl.Versions {

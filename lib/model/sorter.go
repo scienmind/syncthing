@@ -2,16 +2,16 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package model
 
 import (
 	"encoding/binary"
 	"io/ioutil"
+	"os"
 	"sort"
 
-	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
@@ -186,7 +186,7 @@ func (s *onDiskIndexSorter) Sorted(fn func(protocol.FileInfo) bool) {
 func (s *onDiskIndexSorter) Close() {
 	l.Debugf("onDiskIndexSorter %p closes", s)
 	s.db.Close()
-	osutil.RemoveAll(s.dir)
+	os.RemoveAll(s.dir)
 }
 
 func (s *onDiskIndexSorter) full() bool {
