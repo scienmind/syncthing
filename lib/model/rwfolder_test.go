@@ -7,6 +7,7 @@
 package model
 
 import (
+	"context"
 	"crypto/rand"
 	"io"
 	"os"
@@ -77,19 +78,26 @@ func setUpModel(file protocol.FileInfo) *Model {
 	return model
 }
 
-func setUpSendReceiveFolder(model *Model) sendReceiveFolder {
-	return sendReceiveFolder{
+func setUpSendReceiveFolder(model *Model) *sendReceiveFolder {
+	f := &sendReceiveFolder{
 		folder: folder{
-			stateTracker: newStateTracker("default"),
-			model:        model,
+			stateTracker:        newStateTracker("default"),
+			model:               model,
+			initialScanFinished: make(chan struct{}),
+			ctx:                 context.TODO(),
 		},
 
-		mtimeFS:   fs.NewMtimeFS(db.NewNamespacedKV(model.db, "mtime")),
+		mtimeFS:   fs.NewMtimeFS(fs.DefaultFilesystem, db.NewNamespacedKV(model.db, "mtime")),
 		dir:       "testdata",
 		queue:     newJobQueue(),
 		errors:    make(map[string]string),
 		errorsMut: sync.NewMutex(),
 	}
+
+	// Folders are never actually started, so no initial scan will be done
+	close(f.initialScanFinished)
+
+	return f
 }
 
 // Layout of the files: (indexes from the above array)
@@ -238,7 +246,7 @@ func TestCopierFinder(t *testing.T) {
 	}
 
 	// Verify that the fetched blocks have actually been written to the temp file
-	blks, err := scanner.HashFile(tempFile, protocol.BlockSize, nil, false)
+	blks, err := scanner.HashFile(context.TODO(), fs.DefaultFilesystem, tempFile, protocol.BlockSize, nil, false)
 	if err != nil {
 		t.Log(err)
 	}
@@ -291,7 +299,7 @@ func TestWeakHash(t *testing.T) {
 	// File 1: abcdefgh
 	// File 2: xyabcdef
 	f.Seek(0, os.SEEK_SET)
-	existing, err := scanner.Blocks(f, protocol.BlockSize, size, nil, true)
+	existing, err := scanner.Blocks(context.TODO(), f, protocol.BlockSize, size, nil, true)
 	if err != nil {
 		t.Error(err)
 	}
@@ -300,7 +308,7 @@ func TestWeakHash(t *testing.T) {
 	remainder := io.LimitReader(f, size-shift)
 	prefix := io.LimitReader(rand.Reader, shift)
 	nf := io.MultiReader(prefix, remainder)
-	desired, err := scanner.Blocks(nf, protocol.BlockSize, size, nil, true)
+	desired, err := scanner.Blocks(context.TODO(), nf, protocol.BlockSize, size, nil, true)
 	if err != nil {
 		t.Error(err)
 	}

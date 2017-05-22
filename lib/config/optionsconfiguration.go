@@ -123,7 +123,7 @@ type OptionsConfiguration struct {
 	CacheIgnoredFiles       bool                    `xml:"cacheIgnoredFiles" json:"cacheIgnoredFiles" default:"false"`
 	ProgressUpdateIntervalS int                     `xml:"progressUpdateIntervalS" json:"progressUpdateIntervalS" default:"5"`
 	LimitBandwidthInLan     bool                    `xml:"limitBandwidthInLan" json:"limitBandwidthInLan" default:"false"`
-	MinHomeDiskFreePct      float64                 `xml:"minHomeDiskFreePct" json:"minHomeDiskFreePct" default:"1"`
+	MinHomeDiskFree         Size                    `xml:"minHomeDiskFree" json:"minHomeDiskFree" default:"1 %"`
 	ReleasesURL             string                  `xml:"releasesURL" json:"releasesURL" default:"https://upgrades.syncthing.net/meta.json"`
 	AlwaysLocalNets         []string                `xml:"alwaysLocalNet" json:"alwaysLocalNets"`
 	OverwriteRemoteDevNames bool                    `xml:"overwriteRemoteDeviceNamesOnConnect" json:"overwriteRemoteDeviceNamesOnConnect" default:"false"`
@@ -131,12 +131,22 @@ type OptionsConfiguration struct {
 	UnackedNotificationIDs  []string                `xml:"unackedNotificationID" json:"unackedNotificationIDs"`
 	TrafficClass            int                     `xml:"trafficClass" json:"trafficClass"`
 	WeakHashSelectionMethod WeakHashSelectionMethod `xml:"weakHashSelectionMethod" json:"weakHashSelectionMethod"`
+	StunServers             []string                `xml:"stunServer" json:"stunServers" default:"default"`
+	StunKeepaliveS          int                     `xml:"stunKeepaliveSeconds" json:"stunKeepaliveSeconds" default:"24"`
+	DefaultKCPEnabled       bool                    `xml:"defaultKCPEnabled" json:"defaultKCPEnabled" default:"false"`
+	KCPNoDelay              bool                    `xml:"kcpNoDelay" json:"kcpNoDelay" default:"false"`
+	KCPUpdateIntervalMs     int                     `xml:"kcpUpdateIntervalMs" json:"kcpUpdateIntervalMs" default:"25"`
+	KCPFastResend           bool                    `xml:"kcpFastResend" json:"kcpFastResend" default:"false"`
+	KCPCongestionControl    bool                    `xml:"kcpCongestionControl" json:"kcpCongestionControl" default:"true"`
+	KCPSendWindowSize       int                     `xml:"kcpSendWindowSize" json:"kcpSendWindowSize" default:"128"`
+	KCPReceiveWindowSize    int                     `xml:"kcpReceiveWindowSize" json:"kcpReceiveWindowSize" default:"128"`
 
-	DeprecatedUPnPEnabled  bool     `xml:"upnpEnabled,omitempty" json:"-"`
-	DeprecatedUPnPLeaseM   int      `xml:"upnpLeaseMinutes,omitempty" json:"-"`
-	DeprecatedUPnPRenewalM int      `xml:"upnpRenewalMinutes,omitempty" json:"-"`
-	DeprecatedUPnPTimeoutS int      `xml:"upnpTimeoutSeconds,omitempty" json:"-"`
-	DeprecatedRelayServers []string `xml:"relayServer,omitempty" json:"-"`
+	DeprecatedUPnPEnabled        bool     `xml:"upnpEnabled,omitempty" json:"-"`
+	DeprecatedUPnPLeaseM         int      `xml:"upnpLeaseMinutes,omitempty" json:"-"`
+	DeprecatedUPnPRenewalM       int      `xml:"upnpRenewalMinutes,omitempty" json:"-"`
+	DeprecatedUPnPTimeoutS       int      `xml:"upnpTimeoutSeconds,omitempty" json:"-"`
+	DeprecatedRelayServers       []string `xml:"relayServer,omitempty" json:"-"`
+	DeprecatedMinHomeDiskFreePct float64  `xml:"minHomeDiskFreePct" json:"-"`
 }
 
 func (orig OptionsConfiguration) Copy() OptionsConfiguration {
