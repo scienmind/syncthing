@@ -25,11 +25,11 @@ func (v Vector) Update(id ShortID) Vector {
 			nv[i].ID = id
 			nv[i].Value = 1
 			copy(nv[i+1:], v.Counters[i:])
-			return Vector{nv}
+			return Vector{Counters: nv}
 		}
 	}
 	// Append a new index
-	return Vector{append(v.Counters, Counter{id, 1})}
+	return Vector{Counters: append(v.Counters, Counter{ID: id, Value: 1})}
 }
 
 // Merge returns the vector containing the maximum indexes from v and b. If it
@@ -40,7 +40,7 @@ func (v Vector) Merge(b Vector) Vector {
 	for bi < len(b.Counters) {
 		if vi == len(v.Counters) {
 			// We've reach the end of v, all that remains are appends
-			return Vector{append(v.Counters, b.Counters[bi:]...)}
+			return Vector{Counters: append(v.Counters, b.Counters[bi:]...)}
 		}
 
 		if v.Counters[vi].ID > b.Counters[bi].ID {
@@ -71,7 +71,7 @@ func (v Vector) Merge(b Vector) Vector {
 func (v Vector) Copy() Vector {
 	nv := make([]Counter, len(v.Counters))
 	copy(nv, v.Counters)
-	return Vector{nv}
+	return Vector{Counters: nv}
 }
 
 // Equal returns true when the two vectors are equivalent.
@@ -107,6 +107,18 @@ func (v Vector) Counter(id ShortID) uint64 {
 		}
 	}
 	return 0
+}
+
+// DropOthers removes all counters, keeping only the one with given id. If there
+// is no such counter, an empty Vector is returned.
+func (v Vector) DropOthers(id ShortID) Vector {
+	for i, c := range v.Counters {
+		if c.ID == id {
+			v.Counters = v.Counters[i : i+1]
+			return v
+		}
+	}
+	return Vector{}
 }
 
 // Ordering represents the relationship between two Vectors.

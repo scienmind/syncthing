@@ -13,25 +13,23 @@
 package db
 
 import (
-	stdsync "sync"
-	"sync/atomic"
+	"os"
+	"time"
 
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/sync"
+	"github.com/syndtr/goleveldb/leveldb/util"
 )
 
 type FileSet struct {
-	sequence   int64 // Our local sequence number
-	folder     string
-	db         *Instance
-	blockmap   *BlockMap
-	localSize  sizeTracker
-	globalSize sizeTracker
+	folder string
+	fs     fs.Filesystem
+	db     *instance
+	meta   *metadataTracker
 
-	remoteSequence map[protocol.DeviceID]int64 // Highest seen sequence numbers for other devices
-	updateMutex    sync.Mutex                  // protects remoteSequence and database updates
+	updateMutex sync.Mutex // protects database updates and the corresponding metadata changes
 }
 
 // FileIntf is the set of methods implemented by both protocol.FileInfo and
@@ -39,11 +37,24 @@ type FileSet struct {
 type FileIntf interface {
 	FileSize() int64
 	FileName() string
+	FileLocalFlags() uint32
 	IsDeleted() bool
 	IsInvalid() bool
+	IsIgnored() bool
+	IsUnsupported() bool
+	MustRescan() bool
+	IsReceiveOnlyChanged() bool
 	IsDirectory() bool
 	IsSymlink() bool
+	ShouldConflict() bool
 	HasPermissionBits() bool
+	SequenceNo() int64
+	BlockSize() int
+	FileVersion() protocol.Vector
+	FileType() protocol.FileInfoType
+	FilePermissions() uint32
+	FileModifiedBy() protocol.ShortID
+	ModTime() time.Time
 }
 
 // The Iterator is called with either a protocol.FileInfo or a
@@ -51,149 +62,98 @@ type FileIntf interface {
 // continue iteration, false to stop.
 type Iterator func(f FileIntf) bool
 
-type Counts struct {
-	Files       int
-	Directories int
-	Symlinks    int
-	Deleted     int
-	Bytes       int64
+var databaseRecheckInterval = 30 * 24 * time.Hour
+
+func init() {
+	if dur, err := time.ParseDuration(os.Getenv("STRECHECKDBEVERY")); err == nil {
+		databaseRecheckInterval = dur
+	}
 }
 
-type sizeTracker struct {
-	Counts
-	mut stdsync.Mutex
-}
+func NewFileSet(folder string, fs fs.Filesystem, ll *Lowlevel) *FileSet {
+	db := newInstance(ll)
 
-func (s *sizeTracker) addFile(f FileIntf) {
-	if f.IsInvalid() {
-		return
-	}
-
-	s.mut.Lock()
-	switch {
-	case f.IsDeleted():
-		s.Deleted++
-	case f.IsDirectory() && !f.IsSymlink():
-		s.Directories++
-	case f.IsSymlink():
-		s.Symlinks++
-	default:
-		s.Files++
-	}
-	s.Bytes += f.FileSize()
-	s.mut.Unlock()
-}
-
-func (s *sizeTracker) removeFile(f FileIntf) {
-	if f.IsInvalid() {
-		return
-	}
-
-	s.mut.Lock()
-	switch {
-	case f.IsDeleted():
-		s.Deleted--
-	case f.IsDirectory() && !f.IsSymlink():
-		s.Directories--
-	case f.IsSymlink():
-		s.Symlinks--
-	default:
-		s.Files--
-	}
-	s.Bytes -= f.FileSize()
-	if s.Deleted < 0 || s.Files < 0 || s.Directories < 0 || s.Symlinks < 0 {
-		panic("bug: removed more than added")
-	}
-	s.mut.Unlock()
-}
-
-func (s *sizeTracker) Size() Counts {
-	s.mut.Lock()
-	defer s.mut.Unlock()
-	return s.Counts
-}
-
-func NewFileSet(folder string, db *Instance) *FileSet {
 	var s = FileSet{
-		remoteSequence: make(map[protocol.DeviceID]int64),
-		folder:         folder,
-		db:             db,
-		blockmap:       NewBlockMap(db, db.folderIdx.ID([]byte(folder))),
-		updateMutex:    sync.NewMutex(),
+		folder:      folder,
+		fs:          fs,
+		db:          db,
+		meta:        newMetadataTracker(),
+		updateMutex: sync.NewMutex(),
 	}
 
-	s.db.checkGlobals([]byte(folder), &s.globalSize)
-
-	var deviceID protocol.DeviceID
-	s.db.withAllFolderTruncated([]byte(folder), func(device []byte, f FileInfoTruncated) bool {
-		copy(deviceID[:], device)
-		if deviceID == protocol.LocalDeviceID {
-			if f.Sequence > s.sequence {
-				s.sequence = f.Sequence
-			}
-			s.localSize.addFile(f)
-		} else if f.Sequence > s.remoteSequence[deviceID] {
-			s.remoteSequence[deviceID] = f.Sequence
-		}
-		return true
-	})
-	l.Debugf("loaded sequence for %q: %#v", folder, s.sequence)
+	if err := s.meta.fromDB(db, []byte(folder)); err != nil {
+		l.Infof("No stored folder metadata for %q: recalculating", folder)
+		s.recalcCounts()
+	} else if age := time.Since(s.meta.Created()); age > databaseRecheckInterval {
+		l.Infof("Stored folder metadata for %q is %v old; recalculating", folder, age)
+		s.recalcCounts()
+	}
 
 	return &s
 }
 
-func (s *FileSet) Replace(device protocol.DeviceID, fs []protocol.FileInfo) {
-	l.Debugf("%s Replace(%v, [%d])", s.folder, device, len(fs))
-	normalizeFilenames(fs)
+func (s *FileSet) recalcCounts() {
+	s.meta = newMetadataTracker()
+
+	s.db.checkGlobals([]byte(s.folder), s.meta)
+
+	var deviceID protocol.DeviceID
+	s.db.withAllFolderTruncated([]byte(s.folder), func(device []byte, f FileInfoTruncated) bool {
+		copy(deviceID[:], device)
+		s.meta.addFile(deviceID, f)
+		return true
+	})
+
+	s.meta.SetCreated()
+	s.meta.toDB(s.db, []byte(s.folder))
+}
+
+func (s *FileSet) Drop(device protocol.DeviceID) {
+	l.Debugf("%s Drop(%v)", s.folder, device)
 
 	s.updateMutex.Lock()
 	defer s.updateMutex.Unlock()
 
+	s.db.dropDeviceFolder(device[:], []byte(s.folder), s.meta)
+
 	if device == protocol.LocalDeviceID {
-		if len(fs) == 0 {
-			s.sequence = 0
-		} else {
-			// Always overwrite Sequence on updated files to ensure
-			// correct ordering. The caller is supposed to leave it set to
-			// zero anyhow.
-			for i := range fs {
-				fs[i].Sequence = atomic.AddInt64(&s.sequence, 1)
-			}
-		}
+		s.meta.resetCounts(device)
+		// We deliberately do not reset the sequence number here. Dropping
+		// all files for the local device ID only happens in testing - which
+		// expects the sequence to be retained, like an old Replace() of all
+		// files would do. However, if we ever did it "in production" we
+		// would anyway want to retain the sequence for delta indexes to be
+		// happy.
 	} else {
-		s.remoteSequence[device] = maxSequence(fs)
+		// Here, on the other hand, we want to make sure that any file
+		// announced from the remote is newer than our current sequence
+		// number.
+		s.meta.resetAll(device)
 	}
-	s.db.replace([]byte(s.folder), device[:], fs, &s.localSize, &s.globalSize)
-	if device == protocol.LocalDeviceID {
-		s.blockmap.Drop()
-		s.blockmap.Add(fs)
-	}
+
+	s.meta.toDB(s.db, []byte(s.folder))
 }
 
 func (s *FileSet) Update(device protocol.DeviceID, fs []protocol.FileInfo) {
 	l.Debugf("%s Update(%v, [%d])", s.folder, device, len(fs))
+
+	// do not modify fs in place, it is still used in outer scope
+	fs = append([]protocol.FileInfo(nil), fs...)
+
 	normalizeFilenames(fs)
 
 	s.updateMutex.Lock()
 	defer s.updateMutex.Unlock()
 
+	defer s.meta.toDB(s.db, []byte(s.folder))
+
 	if device == protocol.LocalDeviceID {
-		discards := make([]protocol.FileInfo, 0, len(fs))
-		updates := make([]protocol.FileInfo, 0, len(fs))
-		for i, newFile := range fs {
-			fs[i].Sequence = atomic.AddInt64(&s.sequence, 1)
-			existingFile, ok := s.db.getFile([]byte(s.folder), device[:], []byte(newFile.Name))
-			if !ok || !existingFile.Version.Equal(newFile.Version) {
-				discards = append(discards, existingFile)
-				updates = append(updates, newFile)
-			}
-		}
-		s.blockmap.Discard(discards)
-		s.blockmap.Update(updates)
-	} else {
-		s.remoteSequence[device] = maxSequence(fs)
+		// For the local device we have a bunch of metadata to track.
+		s.db.updateLocalFiles([]byte(s.folder), fs, s.meta)
+		return
 	}
-	s.db.updateFiles([]byte(s.folder), device[:], fs, &s.localSize, &s.globalSize)
+	// Easy case, just update the files and we're done.
+	s.db.updateRemoteFiles([]byte(s.folder), device[:], fs, s.meta)
 }
 
 func (s *FileSet) WithNeed(device protocol.DeviceID, fn Iterator) {
@@ -216,8 +176,15 @@ func (s *FileSet) WithHaveTruncated(device protocol.DeviceID, fn Iterator) {
 	s.db.withHave([]byte(s.folder), device[:], nil, true, nativeFileIterator(fn))
 }
 
+func (s *FileSet) WithHaveSequence(startSeq int64, fn Iterator) {
+	l.Debugf("%s WithHaveSequence(%v)", s.folder, startSeq)
+	s.db.withHaveSequence([]byte(s.folder), startSeq, nativeFileIterator(fn))
+}
+
+// Except for an item with a path equal to prefix, only children of prefix are iterated.
+// E.g. for prefix "dir", "dir/file" is iterated, but "dir.file" is not.
 func (s *FileSet) WithPrefixedHaveTruncated(device protocol.DeviceID, prefix string, fn Iterator) {
-	l.Debugf("%s WithPrefixedHaveTruncated(%v)", s.folder, device)
+	l.Debugf(`%s WithPrefixedHaveTruncated(%v, "%v")`, s.folder, device, prefix)
 	s.db.withHave([]byte(s.folder), device[:], []byte(osutil.NormalizedFilename(prefix)), true, nativeFileIterator(fn))
 }
 func (s *FileSet) WithGlobal(fn Iterator) {
@@ -230,19 +197,21 @@ func (s *FileSet) WithGlobalTruncated(fn Iterator) {
 	s.db.withGlobal([]byte(s.folder), nil, true, nativeFileIterator(fn))
 }
 
+// Except for an item with a path equal to prefix, only children of prefix are iterated.
+// E.g. for prefix "dir", "dir/file" is iterated, but "dir.file" is not.
 func (s *FileSet) WithPrefixedGlobalTruncated(prefix string, fn Iterator) {
-	l.Debugf("%s WithPrefixedGlobalTruncated()", s.folder, prefix)
+	l.Debugf(`%s WithPrefixedGlobalTruncated("%v")`, s.folder, prefix)
 	s.db.withGlobal([]byte(s.folder), []byte(osutil.NormalizedFilename(prefix)), true, nativeFileIterator(fn))
 }
 
 func (s *FileSet) Get(device protocol.DeviceID, file string) (protocol.FileInfo, bool) {
-	f, ok := s.db.getFile([]byte(s.folder), device[:], []byte(osutil.NormalizedFilename(file)))
+	f, ok := s.db.getFileDirty([]byte(s.folder), device[:], []byte(osutil.NormalizedFilename(file)))
 	f.Name = osutil.NativeFilename(f.Name)
 	return f, ok
 }
 
 func (s *FileSet) GetGlobal(file string) (protocol.FileInfo, bool) {
-	fi, ok := s.db.getGlobal([]byte(s.folder), []byte(osutil.NormalizedFilename(file)), false)
+	fi, ok := s.db.getGlobalDirty([]byte(s.folder), []byte(osutil.NormalizedFilename(file)), false)
 	if !ok {
 		return protocol.FileInfo{}, false
 	}
@@ -252,7 +221,7 @@ func (s *FileSet) GetGlobal(file string) (protocol.FileInfo, bool) {
 }
 
 func (s *FileSet) GetGlobalTruncated(file string) (FileInfoTruncated, bool) {
-	fi, ok := s.db.getGlobal([]byte(s.folder), []byte(osutil.NormalizedFilename(file)), true)
+	fi, ok := s.db.getGlobalDirty([]byte(s.folder), []byte(osutil.NormalizedFilename(file)), true)
 	if !ok {
 		return FileInfoTruncated{}, false
 	}
@@ -266,21 +235,23 @@ func (s *FileSet) Availability(file string) []protocol.DeviceID {
 }
 
 func (s *FileSet) Sequence(device protocol.DeviceID) int64 {
-	if device == protocol.LocalDeviceID {
-		return atomic.LoadInt64(&s.sequence)
-	}
-
-	s.updateMutex.Lock()
-	defer s.updateMutex.Unlock()
-	return s.remoteSequence[device]
+	return s.meta.Sequence(device)
 }
 
 func (s *FileSet) LocalSize() Counts {
-	return s.localSize.Size()
+	local := s.meta.Counts(protocol.LocalDeviceID, 0)
+	recvOnlyChanged := s.meta.Counts(protocol.LocalDeviceID, protocol.FlagLocalReceiveOnly)
+	return local.Add(recvOnlyChanged)
+}
+
+func (s *FileSet) ReceiveOnlyChangedSize() Counts {
+	return s.meta.Counts(protocol.LocalDeviceID, protocol.FlagLocalReceiveOnly)
 }
 
 func (s *FileSet) GlobalSize() Counts {
-	return s.globalSize.Size()
+	global := s.meta.Counts(protocol.GlobalDeviceID, 0)
+	recvOnlyChanged := s.meta.Counts(protocol.GlobalDeviceID, protocol.FlagLocalReceiveOnly)
+	return global.Add(recvOnlyChanged)
 }
 
 func (s *FileSet) IndexID(device protocol.DeviceID) protocol.IndexID {
@@ -301,47 +272,35 @@ func (s *FileSet) SetIndexID(device protocol.DeviceID, id protocol.IndexID) {
 }
 
 func (s *FileSet) MtimeFS() *fs.MtimeFS {
-	prefix := s.db.mtimesKey([]byte(s.folder))
-	kv := NewNamespacedKV(s.db, string(prefix))
-	return fs.NewMtimeFS(fs.DefaultFilesystem, kv)
+	prefix := s.db.keyer.GenerateMtimesKey(nil, []byte(s.folder))
+	kv := NewNamespacedKV(s.db.Lowlevel, string(prefix))
+	return fs.NewMtimeFS(s.fs, kv)
 }
 
 func (s *FileSet) ListDevices() []protocol.DeviceID {
-	s.updateMutex.Lock()
-	devices := make([]protocol.DeviceID, 0, len(s.remoteSequence))
-	for id, seq := range s.remoteSequence {
-		if seq > 0 {
-			devices = append(devices, id)
-		}
-	}
-	s.updateMutex.Unlock()
-	return devices
-}
-
-// maxSequence returns the highest of the Sequence numbers found in
-// the given slice of FileInfos. This should really be the Sequence of
-// the last item, but Syncthing v0.14.0 and other implementations may not
-// implement update sorting....
-func maxSequence(fs []protocol.FileInfo) int64 {
-	var max int64
-	for _, f := range fs {
-		if f.Sequence > max {
-			max = f.Sequence
-		}
-	}
-	return max
+	return s.meta.devices()
 }
 
 // DropFolder clears out all information related to the given folder from the
 // database.
-func DropFolder(db *Instance, folder string) {
+func DropFolder(ll *Lowlevel, folder string) {
+	db := newInstance(ll)
 	db.dropFolder([]byte(folder))
 	db.dropMtimes([]byte(folder))
-	bm := &BlockMap{
-		db:     db,
-		folder: db.folderIdx.ID([]byte(folder)),
+	db.dropFolderMeta([]byte(folder))
+
+	// Also clean out the folder ID mapping.
+	db.folderIdx.Delete([]byte(folder))
+}
+
+// DropDeltaIndexIDs removes all delta index IDs from the database.
+// This will cause a full index transmission on the next connection.
+func DropDeltaIndexIDs(db *Lowlevel) {
+	dbi := db.NewIterator(util.BytesPrefix([]byte{KeyTypeIndexID}), nil)
+	defer dbi.Release()
+	for dbi.Next() {
+		db.Delete(dbi.Key(), nil)
 	}
-	bm.Drop()
 }
 
 func normalizeFilenames(fs []protocol.FileInfo) {

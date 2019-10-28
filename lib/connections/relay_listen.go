@@ -16,6 +16,7 @@ import (
 	"github.com/syncthing/syncthing/lib/dialer"
 	"github.com/syncthing/syncthing/lib/nat"
 	"github.com/syncthing/syncthing/lib/relay/client"
+	"github.com/syncthing/syncthing/lib/util"
 )
 
 func init() {
@@ -26,63 +27,62 @@ func init() {
 }
 
 type relayListener struct {
+	util.ServiceWithError
 	onAddressesChangedNotifier
 
 	uri     *url.URL
-	cfg     *config.Wrapper
+	cfg     config.Wrapper
 	tlsCfg  *tls.Config
 	conns   chan internalConn
 	factory listenerFactory
 
-	err    error
 	client client.RelayClient
 	mut    sync.RWMutex
 }
 
-func (t *relayListener) Serve() {
-	t.mut.Lock()
-	t.err = nil
-	t.mut.Unlock()
-
+func (t *relayListener) serve(stop chan struct{}) error {
 	clnt, err := client.NewClient(t.uri, t.tlsCfg.Certificates, nil, 10*time.Second)
-	invitations := clnt.Invitations()
 	if err != nil {
-		t.mut.Lock()
-		t.err = err
-		t.mut.Unlock()
-		l.Warnln("listen (BEP/relay):", err)
-		return
+		l.Infoln("Listen (BEP/relay):", err)
+		return err
 	}
-
-	go clnt.Serve()
+	invitations := clnt.Invitations()
 
 	t.mut.Lock()
 	t.client = clnt
+	go clnt.Serve()
+	defer clnt.Stop()
 	t.mut.Unlock()
 
 	oldURI := clnt.URI()
+
+	l.Infof("Relay listener (%v) starting", t)
+	defer l.Infof("Relay listener (%v) shutting down", t)
 
 	for {
 		select {
 		case inv, ok := <-invitations:
 			if !ok {
-				return
+				if err := clnt.Error(); err != nil {
+					l.Infoln("Listen (BEP/relay):", err)
+				}
+				return err
 			}
 
 			conn, err := client.JoinSession(inv)
 			if err != nil {
-				l.Infoln("Joining relay session (BEP/relay):", err)
+				l.Infoln("Listen (BEP/relay): joining session:", err)
 				continue
 			}
 
 			err = dialer.SetTCPOptions(conn)
 			if err != nil {
-				l.Infoln(err)
+				l.Debugln("Listen (BEP/relay): setting tcp options:", err)
 			}
 
 			err = dialer.SetTrafficClass(conn, t.cfg.Options().TrafficClass)
 			if err != nil {
-				l.Debugf("failed to set traffic class: %s", err)
+				l.Debugln("Listen (BEP/relay): setting traffic class:", err)
 			}
 
 			var tc *tls.Conn
@@ -95,7 +95,7 @@ func (t *relayListener) Serve() {
 			err = tlsTimedHandshake(tc)
 			if err != nil {
 				tc.Close()
-				l.Infoln("TLS handshake (BEP/relay):", err)
+				l.Infoln("Listen (BEP/relay): TLS handshake:", err)
 				continue
 			}
 
@@ -111,16 +111,11 @@ func (t *relayListener) Serve() {
 				oldURI = currentURI
 				t.notifyAddressesChanged(t)
 			}
+
+		case <-stop:
+			return nil
 		}
 	}
-}
-
-func (t *relayListener) Stop() {
-	t.mut.RLock()
-	if t.client != nil {
-		t.client.Stop()
-	}
-	t.mut.RUnlock()
 }
 
 func (t *relayListener) URI() *url.URL {
@@ -149,18 +144,16 @@ func (t *relayListener) LANAddresses() []*url.URL {
 }
 
 func (t *relayListener) Error() error {
-	t.mut.RLock()
-	err := t.err
-	var cerr error
-	if t.client != nil {
-		cerr = t.client.Error()
-	}
-	t.mut.RUnlock()
-
+	err := t.ServiceWithError.Error()
 	if err != nil {
 		return err
 	}
-	return cerr
+	t.mut.RLock()
+	defer t.mut.RUnlock()
+	if t.client != nil {
+		return t.client.Error()
+	}
+	return nil
 }
 
 func (t *relayListener) Factory() listenerFactory {
@@ -171,18 +164,27 @@ func (t *relayListener) String() string {
 	return t.uri.String()
 }
 
+func (t *relayListener) NATType() string {
+	return "unknown"
+}
+
 type relayListenerFactory struct{}
 
-func (f *relayListenerFactory) New(uri *url.URL, cfg *config.Wrapper, tlsCfg *tls.Config, conns chan internalConn, natService *nat.Service) genericListener {
-	return &relayListener{
+func (f *relayListenerFactory) New(uri *url.URL, cfg config.Wrapper, tlsCfg *tls.Config, conns chan internalConn, natService *nat.Service) genericListener {
+	t := &relayListener{
 		uri:     uri,
 		cfg:     cfg,
 		tlsCfg:  tlsCfg,
 		conns:   conns,
 		factory: f,
 	}
+	t.ServiceWithError = util.AsServiceWithError(t.serve)
+	return t
 }
 
-func (relayListenerFactory) Enabled(cfg config.Configuration) bool {
-	return cfg.Options.RelaysEnabled
+func (relayListenerFactory) Valid(cfg config.Configuration) error {
+	if !cfg.Options.RelaysEnabled {
+		return errDisabled
+	}
+	return nil
 }

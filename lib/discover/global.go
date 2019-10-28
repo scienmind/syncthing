@@ -19,18 +19,23 @@ import (
 	stdsync "sync"
 	"time"
 
+	"github.com/thejerf/suture"
+
 	"github.com/syncthing/syncthing/lib/dialer"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
+	"github.com/syncthing/syncthing/lib/util"
 )
 
 type globalClient struct {
+	suture.Service
 	server         string
 	addrList       AddressLister
 	announceClient httpClient
 	queryClient    httpClient
 	noAnnounce     bool
-	stop           chan struct{}
+	noLookup       bool
+	evLogger       events.Logger
 	errorHolder
 }
 
@@ -52,6 +57,7 @@ type announcement struct {
 type serverOptions struct {
 	insecure   bool   // don't check certificate
 	noAnnounce bool   // don't announce
+	noLookup   bool   // don't use for lookups
 	id         string // expected server device ID
 }
 
@@ -65,7 +71,7 @@ func (e lookupError) CacheFor() time.Duration {
 	return e.cacheFor
 }
 
-func NewGlobal(server string, cert tls.Certificate, addrList AddressLister) (FinderService, error) {
+func NewGlobal(server string, cert tls.Certificate, addrList AddressLister, evLogger events.Logger) (FinderService, error) {
 	server, opts, err := parseOptions(server)
 	if err != nil {
 		return nil, err
@@ -119,15 +125,27 @@ func NewGlobal(server string, cert tls.Certificate, addrList AddressLister) (Fin
 		announceClient: announceClient,
 		queryClient:    queryClient,
 		noAnnounce:     opts.noAnnounce,
-		stop:           make(chan struct{}),
+		noLookup:       opts.noLookup,
+		evLogger:       evLogger,
 	}
-	cl.setError(errors.New("not announced"))
+	cl.Service = util.AsService(cl.serve)
+	if !opts.noAnnounce {
+		// If we are supposed to annonce, it's an error until we've done so.
+		cl.setError(errors.New("not announced"))
+	}
 
 	return cl, nil
 }
 
 // Lookup returns the list of addresses where the given device is available
 func (c *globalClient) Lookup(device protocol.DeviceID) (addresses []string, err error) {
+	if c.noLookup {
+		return nil, lookupError{
+			error:    errors.New("lookups not supported"),
+			cacheFor: time.Hour,
+		}
+	}
+
 	qURL, err := url.Parse(c.server)
 	if err != nil {
 		return nil, err
@@ -170,19 +188,19 @@ func (c *globalClient) String() string {
 	return "global@" + c.server
 }
 
-func (c *globalClient) Serve() {
+func (c *globalClient) serve(stop chan struct{}) {
 	if c.noAnnounce {
 		// We're configured to not do announcements, only lookups. To maintain
 		// the same interface, we just pause here if Serve() is run.
-		<-c.stop
+		<-stop
 		return
 	}
 
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 
-	eventSub := events.Default.Subscribe(events.ListenAddressesChanged)
-	defer events.Default.Unsubscribe(eventSub)
+	eventSub := c.evLogger.Subscribe(events.ListenAddressesChanged)
+	defer eventSub.Unsubscribe()
 
 	for {
 		select {
@@ -194,22 +212,23 @@ func (c *globalClient) Serve() {
 		case <-timer.C:
 			c.sendAnnouncement(timer)
 
-		case <-c.stop:
+		case <-stop:
 			return
 		}
 	}
 }
 
 func (c *globalClient) sendAnnouncement(timer *time.Timer) {
-
 	var ann announcement
 	if c.addrList != nil {
 		ann.Addresses = c.addrList.ExternalAddresses()
 	}
 
 	if len(ann.Addresses) == 0 {
-		c.setError(errors.New("nothing to announce"))
-		l.Debugln("Nothing to announce")
+		// There are legitimate cases for not having anything to announce,
+		// yet still using global discovery for lookups. Do not error out
+		// here.
+		c.setError(nil)
 		timer.Reset(announceErrorRetryInterval)
 		return
 	}
@@ -262,10 +281,6 @@ func (c *globalClient) sendAnnouncement(timer *time.Timer) {
 	timer.Reset(defaultReannounceInterval)
 }
 
-func (c *globalClient) Stop() {
-	close(c.stop)
-}
-
 func (c *globalClient) Cache() map[protocol.DeviceID]CacheEntry {
 	// The globalClient doesn't do caching
 	return nil
@@ -285,6 +300,7 @@ func parseOptions(dsn string) (server string, opts serverOptions, err error) {
 	opts.id = q.Get("id")
 	opts.insecure = opts.id != "" || queryBool(q, "insecure")
 	opts.noAnnounce = queryBool(q, "noannounce")
+	opts.noLookup = queryBool(q, "nolookup")
 
 	// Check for disallowed combinations
 	if p.Scheme == "http" {
